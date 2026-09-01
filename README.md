@@ -19,9 +19,9 @@ Flux abstracts the complexity of networking. Instead of choosing between Wi-Fi, 
 
 ### Environment Check
 To ensure your machine is ready for development, run:
-\\\ash
+```Bash
 cargo run --package flux-node -- doctor
-\\\
+```
 
 ## Development
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for toolchain requirements and workflow.
