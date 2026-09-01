@@ -19,3 +19,14 @@ All messages follow a basic Length-Prefix-Type format:
 
 ## 5. Transfer State
 Flux supports **Resume-by-Hash**. Every file is chunked, and every chunk is verified via BLAKE3.
+
+## 6. Local Discovery (v0.1.0)
+### 6.1 mDNS Parameters
+- **Service Type**: \_flux._udp.local.\
+- **Instance Name**: \[PeerID]\
+- **Port**: 9000 (Placeholder)
+
+### 6.2 UDP Heartbeat
+- **Port**: 9001
+- **Payload**: Raw UTF-8 String of the PeerID.
+- **Interval**: 2 Seconds.
