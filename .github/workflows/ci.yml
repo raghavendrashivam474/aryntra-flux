@@ -1,0 +1,19 @@
+name: CI Foundation
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Rust
+        run: rustup update stable
+      - name: Cargo Check
+        run: cargo check
+      - name: Cargo Test
+        run: cargo test
+      - name: Format Check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy -- -D warnings
