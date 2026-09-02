@@ -3,8 +3,8 @@
 ## Phase 1: Core Foundation (Current)
 - [x] S1.1: Project Foundation & CI
 - [x] S1.2: Node Identity & Local Discovery
-- [ ] S1.3: Basic Stream Transfer (TCP)
-- [ ] S1.4: Transport Abstraction Layer
+- [x] S1.3: Basic Stream Transfer (TCP)
+- [x] S1.4: Transport Abstraction Layer
 - [ ] S1.5: QUIC Integration
 
 ## Phase 2: Resilience & Optimization

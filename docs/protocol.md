@@ -1,32 +1,31 @@
-# Flux Wire Protocol (v0.1.0-draft)
+# Flux Wire Protocol (v0.1.0)
 
 ## 1. Overview
-The Flux protocol is a binary-efficient messaging system designed to operate over multiple transports (TCP, QUIC, UDP).
+The Flux wire protocol is a message-oriented protocol operating over reliable binary stream transports (like TCP or QUIC).
 
 ## 2. Identity
-Every node is identified by a **PeerID**, which is a SHA-256 hash of its Public Key (Ed25519).
+Every node is uniquely identified by a UUID-v4 based `PeerId`, persistence-cached locally or generated dynamically using a multi-profile schema.
 
 ## 3. Message Framing
-All messages follow a basic Length-Prefix-Type format:
-- **Length (4 bytes)**: Total size of the payload.
-- **Type (1 byte)**: Message category (Control, Data, Handshake).
-- **Payload**: The encoded data (Protobuf or Bincode).
+To maintain distinct message boundaries over continuous byte streams, all messages follow a **Length-Prefix-Type** framing pattern:
+- **Length prefix (4 bytes)**: Big-endian representation of the serialized payload's size.
+- **Maximum Message Guard**: Enforced limit of **1 MB** (`1,048,576` bytes) to prevent resource allocation exhaustion attacks.
+- **Payload**: Serialized representation of a `FluxMessage` utilizing `bincode`.
 
 ## 4. Handshake Sequence
-1. **SYN**: Initiator sends PeerID and Capabilities.
-2. **ACK**: Receiver validates identity and responds with chosen parameters.
-3. **EST**: Connection established; Encryption keys rotated.
+Prior to establishing an active communication channel, peers execute a two-way identity validation handshake:
+1. **Hello**: The client sends a `Hello` message detailing its protocol version and unique `PeerId`.
+2. **HelloAck**: The server validates the protocol version, records the client's `PeerId` inside the transport connection, and responds with its own protocol version and `PeerId`.
+3. **Established**: The session transitions to the `Established` state, enabling general message exchange.
 
-## 5. Transfer State
-Flux supports **Resume-by-Hash**. Every file is chunked, and every chunk is verified via BLAKE3.
+## 5. Message Catalog
+- **Hello (Type: Hello)**: `version: u16`, `peer_id: PeerId` (client handshake initiator).
+- **HelloAck (Type: HelloAck)**: `version: u16`, `peer_id: PeerId` (server response).
+- **Ping (Type: Ping)**: `sequence: u32`, `payload: String` (test transmission).
+- **Pong (Type: Pong)**: `sequence: u32`, `payload: String` (test echo).
+- **Goodbye (Type: Goodbye)**: Graceful close notification.
 
-## 6. Local Discovery (v0.1.0)
-### 6.1 mDNS Parameters
-- **Service Type**: \_flux._udp.local.\
-- **Instance Name**: \[PeerID]\
-- **Port**: 9000 (Placeholder)
-
-### 6.2 UDP Heartbeat
-- **Port**: 9001
-- **Payload**: Raw UTF-8 String of the PeerID.
-- **Interval**: 2 Seconds.
+## 6. Ports and Addresses
+- **mDNS Service discovery**: `_flux._udp.local.` (Port: 9000)
+- **UDP Heartbeat Fallback**: Broadcast (Port: 9001)
+- **Direct TCP Connection**: Communication port (Port: 9002)
