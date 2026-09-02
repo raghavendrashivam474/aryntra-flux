@@ -14,3 +14,7 @@ pub use protocol::{FluxMessage, PROTOCOL_VERSION};
 // S1.3: Session management
 pub mod session;
 pub use session::{Session, SessionBuilder, SessionState};
+
+// S1.4: File transfer
+pub mod transfer;
+pub use transfer::{TransferId, TransferManager, TransferMetadata};
