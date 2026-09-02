@@ -1,6 +1,6 @@
+use crate::discovery;
 use crate::identity::PeerId;
 use crate::peer::PeerRegistry;
-use crate::discovery;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeState {

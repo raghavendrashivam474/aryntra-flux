@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PeerId(Uuid);
@@ -9,10 +9,6 @@ pub struct PeerId(Uuid);
 impl PeerId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
-    }
-
-    pub fn to_string(&self) -> String {
-        self.0.to_string()
     }
 
     pub fn get_storage_path(profile: &str) -> PathBuf {
@@ -42,6 +38,12 @@ impl PeerId {
         let data = serde_json::to_string(&new_id).unwrap();
         fs::write(path, data).unwrap();
         new_id
+    }
+}
+
+impl Default for PeerId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -13,3 +13,8 @@ mdns-sd = "0.9"
 anyhow = "1.0"
 log = "0.4"
 dirs = "5.0"
+
+# S1.3 Transport dependencies
+async-trait = "0.1"
+bincode = "1.3"
+thiserror = "1.0"
