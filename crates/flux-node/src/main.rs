@@ -3,10 +3,12 @@ use flux_core::{
     identity::PeerId,
     node::FluxNode,
     protocol::FluxMessage,
-    session::SessionBuilder,
-    transport::{TcpConnection, TcpTransport, Transport}, // Added Transport trait
+    session::{Session, SessionBuilder},
+    transfer::TransferManager,
+    transport::{TcpConnection, TcpTransport, Transport},
 };
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -28,7 +30,7 @@ enum Commands {
     /// Run discovery and show peers
     Run,
 
-    /// Listen for incoming connections
+    /// Listen for incoming connections and transfers
     Listen {
         /// Port to listen on
         #[arg(short, long, default_value = "9002")]
@@ -44,6 +46,17 @@ enum Commands {
         /// Message to send
         #[arg(short, long, default_value = "Hello from Flux!")]
         message: String,
+    },
+
+    /// Send a file to a peer
+    Send {
+        /// Peer address (IP:PORT)
+        #[arg(short, long)]
+        addr: String,
+
+        /// Path to the file to send
+        #[arg(short, long)]
+        file: String,
     },
 
     /// Health check
@@ -63,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Some(Commands::Doctor) => {
-            println!("✅ Flux node is healthy");
+            println!("Flux node is healthy");
             println!("Identity: {}", node.identity);
         }
 
@@ -89,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Some(Commands::Listen { port }) => {
-            println!("🎧 Aryntra Flux - Listening Mode");
+            println!("Aryntra Flux - Listening Mode");
             println!(
                 "Profile: {}",
                 if cli.profile.is_empty() {
@@ -105,78 +118,89 @@ async fn main() -> anyhow::Result<()> {
             let listen_addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
 
             let mut listener = transport.listen(listen_addr).await?;
-            println!("✅ Listening on {}", listener.local_addr());
+            println!("Listening on {}", listener.local_addr());
             println!("Waiting for connections...\n");
 
             loop {
                 match listener.accept().await {
                     Ok((mut conn, addr)) => {
-                        println!("📥 Incoming connection from {}", addr);
+                        println!("Incoming connection from {}", addr);
 
-                        // Spawn handler for this connection
                         let local_peer_id = node.identity.clone();
                         tokio::spawn(async move {
-                            // Handle server-side handshake
+                            // Server-side handshake
                             if let Some(tcp_conn) =
                                 conn.as_any_mut().downcast_mut::<TcpConnection>()
                             {
                                 if let Err(e) = tcp_conn.server_handshake(&local_peer_id).await {
-                                    eprintln!("❌ Handshake failed: {}", e);
+                                    eprintln!("Handshake failed: {}", e);
                                     return;
                                 }
                             }
 
                             if let Some(peer_id) = conn.peer_id() {
-                                println!("✅ Handshake completed with {}", peer_id);
+                                println!("Handshake completed with {}", peer_id);
                             }
 
-                            // Receive message
-                            match conn.recv_message().await {
-                                Ok(msg) => {
-                                    println!("📨 Received: {:?}", msg);
+                            // Receive first message to decide what to do
+                            let first_msg = conn.recv_message().await;
 
-                                    // Send response
-                                    match msg {
-                                        FluxMessage::Ping { sequence, payload } => {
-                                            println!("   Ping #{}: {}", sequence, payload);
-                                            let response = FluxMessage::pong(
-                                                sequence,
-                                                "Pong from server!".to_string(),
-                                            );
+                            match first_msg {
+                                Ok(FluxMessage::Ping { sequence, payload }) => {
+                                    println!("Received Ping #{}: {}", sequence, payload);
+                                    let response = FluxMessage::pong(
+                                        sequence,
+                                        "Pong from server!".to_string(),
+                                    );
+                                    if let Err(e) = conn.send_message(&response).await {
+                                        eprintln!("Failed to send pong: {}", e);
+                                    } else {
+                                        println!("Sent pong response");
+                                    }
+                                    let _ = conn.close().await;
+                                    println!("Connection closed\n");
+                                }
 
-                                            if let Err(e) = conn.send_message(&response).await {
-                                                eprintln!("❌ Failed to send response: {}", e);
-                                            } else {
-                                                println!("📤 Sent pong response");
-                                            }
-                                        }
-                                        _ => {
-                                            println!("   (Other message type)");
+                                Ok(FluxMessage::TransferRequest { metadata }) => {
+                                    println!("Transfer request: {}", metadata.file_name);
+                                    let mut session = Session::from_connection(conn, local_peer_id);
+                                    let output_dir = PathBuf::from("received");
+                                    match TransferManager::receive_transfer(
+                                        &mut session,
+                                        metadata,
+                                        &output_dir,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => println!("Transfer complete\n"),
+                                        Err(e) => {
+                                            eprintln!("Transfer failed: {}\n", e)
                                         }
                                     }
+                                    let _ = session.close().await;
                                 }
-                                Err(e) => {
-                                    eprintln!("❌ Error receiving message: {}", e);
-                                }
-                            }
 
-                            // Close connection
-                            if let Err(e) = conn.close().await {
-                                eprintln!("❌ Error closing connection: {}", e);
-                            } else {
-                                println!("👋 Connection closed\n");
+                                Ok(other) => {
+                                    println!("Unhandled message: {:?}", other);
+                                    let _ = conn.close().await;
+                                }
+
+                                Err(e) => {
+                                    eprintln!("Error receiving message: {}", e);
+                                    let _ = conn.close().await;
+                                }
                             }
                         });
                     }
                     Err(e) => {
-                        eprintln!("❌ Failed to accept connection: {}", e);
+                        eprintln!("Failed to accept connection: {}", e);
                     }
                 }
             }
         }
 
         Some(Commands::Connect { addr, message }) => {
-            println!("🔌 Aryntra Flux - Client Mode");
+            println!("Aryntra Flux - Client Mode");
             println!(
                 "Profile: {}",
                 if cli.profile.is_empty() {
@@ -191,34 +215,29 @@ async fn main() -> anyhow::Result<()> {
 
             let transport = TcpTransport::new();
             let target_addr: SocketAddr = addr.parse()?;
-
-            // Create a dummy peer ID for connection (we don't know the real one yet)
             let target_peer_id = PeerId::new();
 
-            println!("📡 Connecting to {}...", target_addr);
+            println!("Connecting to {}...", target_addr);
 
             let session_builder = SessionBuilder::new(&transport, node.identity.clone());
             let mut session = session_builder
                 .connect(&target_peer_id, target_addr)
                 .await?;
 
-            println!("✅ Connected!");
+            println!("Connected!");
 
             if let Some(peer_id) = session.peer_id() {
-                println!("🤝 Remote peer: {}", peer_id);
+                println!("Remote peer: {}", peer_id);
             }
 
-            // Send ping message
-            println!("📤 Sending message...");
+            println!("Sending message...");
             let ping = FluxMessage::ping(1, message.clone());
             session.send_message(&ping).await?;
 
-            // Wait for response
-            println!("⏳ Waiting for response...");
+            println!("Waiting for response...");
             match tokio::time::timeout(Duration::from_secs(10), session.recv_message()).await {
                 Ok(Ok(response)) => {
-                    println!("📨 Received response: {:?}", response);
-
+                    println!("Received response: {:?}", response);
                     match response {
                         FluxMessage::Pong { sequence, payload } => {
                             println!("   Pong #{}: {}", sequence, payload);
@@ -229,17 +248,57 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Ok(Err(e)) => {
-                    eprintln!("❌ Error receiving response: {}", e);
+                    eprintln!("Error receiving response: {}", e);
                 }
                 Err(_) => {
-                    eprintln!("❌ Timeout waiting for response");
+                    eprintln!("Timeout waiting for response");
                 }
             }
 
-            // Close session
-            println!("👋 Closing connection...");
+            println!("Closing connection...");
             session.close().await?;
-            println!("✅ Done!");
+            println!("Done!");
+        }
+
+        Some(Commands::Send { addr, file }) => {
+            println!("Aryntra Flux - Send Mode");
+            println!(
+                "Profile: {}",
+                if cli.profile.is_empty() {
+                    "default"
+                } else {
+                    &cli.profile
+                }
+            );
+            println!("Identity: {}", node.identity);
+            println!("Target: {}", addr);
+            println!("File: {}\n", file);
+
+            let file_path = PathBuf::from(file);
+            if !file_path.exists() {
+                eprintln!("File not found: {}", file_path.display());
+                return Ok(());
+            }
+
+            let transport = TcpTransport::new();
+            let target_addr: SocketAddr = addr.parse()?;
+            let target_peer_id = PeerId::new();
+
+            println!("Connecting to {}...", target_addr);
+
+            let session_builder = SessionBuilder::new(&transport, node.identity.clone());
+            let mut session = session_builder
+                .connect(&target_peer_id, target_addr)
+                .await?;
+
+            println!("Connected!\n");
+
+            match TransferManager::send_file(&mut session, &file_path).await {
+                Ok(()) => println!("\nTransfer successful!"),
+                Err(e) => eprintln!("\nTransfer failed: {}", e),
+            }
+
+            session.close().await?;
         }
 
         None => {
