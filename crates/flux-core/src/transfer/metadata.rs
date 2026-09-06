@@ -30,3 +30,27 @@ impl TransferMetadata {
         }
     }
 }
+
+/// Persisted state for a partially completed transfer.
+/// Written to `.part.meta` alongside the `.part` data file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PartialTransferState {
+    pub file_name: String,
+    pub file_size: u64,
+    pub chunk_size: u32,
+    pub total_chunks: u32,
+    pub sha256: [u8; 32],
+    pub chunks_received: u32,
+    pub bytes_received: u64,
+}
+
+impl PartialTransferState {
+    /// Check whether this partial state matches the given transfer metadata.
+    pub fn matches(&self, metadata: &TransferMetadata) -> bool {
+        self.file_name == metadata.file_name
+            && self.file_size == metadata.file_size
+            && self.chunk_size == metadata.chunk_size
+            && self.total_chunks == metadata.total_chunks
+            && self.sha256 == metadata.sha256
+    }
+}

@@ -1,4 +1,4 @@
-use crate::identity::PeerId;
+﻿use crate::identity::PeerId;
 use crate::transfer::{TransferId, TransferMetadata};
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,13 @@ pub enum FluxMessage {
         transfer_id: TransferId,
         success: bool,
         message: String,
+    },
+
+    // --- S1.5: Resume messages ---
+    /// Receiver has partial state and wants to resume from a specific chunk.
+    TransferResume {
+        transfer_id: TransferId,
+        resume_from_chunk: u32,
     },
 }
 
@@ -135,5 +142,20 @@ mod tests {
         let encoded = crate::protocol::framing::encode_message(&chunk).unwrap();
         let decoded = crate::protocol::framing::decode_message(&encoded[4..]).unwrap();
         assert_eq!(chunk, decoded);
+    }
+
+    #[test]
+    fn test_transfer_resume_serialize() {
+        use crate::transfer::TransferId;
+
+        let tid = TransferId::new_v4();
+        let resume = FluxMessage::TransferResume {
+            transfer_id: tid,
+            resume_from_chunk: 42,
+        };
+
+        let encoded = crate::protocol::framing::encode_message(&resume).unwrap();
+        let decoded = crate::protocol::framing::decode_message(&encoded[4..]).unwrap();
+        assert_eq!(resume, decoded);
     }
 }
