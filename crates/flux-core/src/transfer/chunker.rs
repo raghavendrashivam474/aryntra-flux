@@ -1,7 +1,7 @@
 ﻿use super::error::Result;
 use std::path::Path;
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub struct Chunker {
     file: File,
@@ -25,6 +25,24 @@ impl Chunker {
             total_chunks,
             bytes_read: 0,
         })
+    }
+
+    /// Seek to a specific chunk index without reading intermediate data.
+    /// Used for resume: skips already-sent chunks efficiently.
+    pub async fn seek_to_chunk(&mut self, start_index: u32) -> Result<()> {
+        if start_index >= self.total_chunks {
+            self.current_index = self.total_chunks;
+            return Ok(());
+        }
+
+        let byte_offset = start_index as u64 * self.chunk_size as u64;
+        self.file
+            .seek(std::io::SeekFrom::Start(byte_offset))
+            .await?;
+        self.current_index = start_index;
+        self.bytes_read = byte_offset;
+
+        Ok(())
     }
 
     pub async fn next_chunk(&mut self) -> Result<Option<(u32, Vec<u8>)>> {
