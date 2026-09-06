@@ -10,6 +10,7 @@ Flux Core remains agnostic of the specific transport layer.
 4. **Transport Implementation**: QUIC, TCP, Bluetooth, etc.
 
 ## Transfer Subsystem (S1.4 + S1.5)
+```text
 TransferManager
 ├── Chunker (streaming read + seek for resume)
 ├── FileReceiver (reassembly + verification + state persistence)
@@ -20,8 +21,7 @@ Session (send_message / recv_message)
 Protocol (FluxMessage: bincode + 4-byte length prefix)
 ↓
 Transport (TCP)
-
-text
+```
 
 
 ## Path Hierarchy
