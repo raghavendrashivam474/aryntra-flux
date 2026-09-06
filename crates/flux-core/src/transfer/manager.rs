@@ -50,29 +50,49 @@ impl TransferManager {
             })
             .await?;
 
-        // 2. Wait for accept/reject
+        // 2. Wait for accept/reject/resume
         let response = session.recv_message().await?;
-        match response {
+        let start_chunk = match response {
             FluxMessage::TransferAccept { transfer_id } => {
                 if transfer_id != metadata.transfer_id {
                     return Err(TransferError::UnexpectedMessage(
                         "Transfer ID mismatch in accept".to_string(),
                     ));
                 }
+                0
+            }
+            FluxMessage::TransferResume {
+                transfer_id,
+                resume_from_chunk,
+            } => {
+                if transfer_id != metadata.transfer_id {
+                    return Err(TransferError::UnexpectedMessage(
+                        "Transfer ID mismatch in resume".to_string(),
+                    ));
+                }
+                println!(
+                    "  Resuming from chunk {}/{}",
+                    resume_from_chunk, metadata.total_chunks
+                );
+                resume_from_chunk
             }
             FluxMessage::TransferReject { reason, .. } => {
                 return Err(TransferError::Rejected(reason));
             }
             other => {
                 return Err(TransferError::UnexpectedMessage(format!(
-                    "Expected TransferAccept, got {:?}",
+                    "Expected TransferAccept/TransferResume, got {:?}",
                     other
                 )));
             }
+        };
+
+        // 3. Send chunks (skip already-received if resuming)
+        let mut chunker = Chunker::new(file_path, metadata.chunk_size).await?;
+        if start_chunk > 0 {
+            chunker.seek_to_chunk(start_chunk).await?;
         }
 
-        // 3. Send chunks
-        let mut chunker = Chunker::new(file_path, metadata.chunk_size).await?;
         while let Some((index, data)) = chunker.next_chunk().await? {
             session
                 .send_message(&FluxMessage::TransferChunk {
@@ -134,17 +154,34 @@ impl TransferManager {
         println!("    Size:   {} bytes", metadata.file_size);
         println!("    Chunks: {}", metadata.total_chunks);
 
-        // 1. Accept
-        session
-            .send_message(&FluxMessage::TransferAccept {
-                transfer_id: metadata.transfer_id,
-            })
-            .await?;
+        // 1. Check for resumable partial state, then accept or resume
+        let (mut receiver, start_chunk) =
+            match FileReceiver::try_resume(metadata.clone(), output_dir).await? {
+                Some(r) => {
+                    let from = r.resume_from_chunk();
+                    println!("    Resuming from chunk {}/{}", from, metadata.total_chunks);
+                    session
+                        .send_message(&FluxMessage::TransferResume {
+                            transfer_id: metadata.transfer_id,
+                            resume_from_chunk: from,
+                        })
+                        .await?;
+                    (r, from)
+                }
+                None => {
+                    session
+                        .send_message(&FluxMessage::TransferAccept {
+                            transfer_id: metadata.transfer_id,
+                        })
+                        .await?;
+                    let r = FileReceiver::new(metadata.clone(), output_dir).await?;
+                    (r, 0)
+                }
+            };
 
-        // 2. Receive chunks
-        let mut receiver = FileReceiver::new(metadata.clone(), output_dir).await?;
-
-        for _ in 0..metadata.total_chunks {
+        // 2. Receive remaining chunks
+        let remaining = metadata.total_chunks - start_chunk;
+        for _ in 0..remaining {
             let msg = session.recv_message().await?;
             match msg {
                 FluxMessage::TransferChunk {
