@@ -1,4 +1,4 @@
-﻿use flux_core::identity::PeerId;
+use flux_core::identity::PeerId;
 use flux_core::protocol::FluxMessage;
 use flux_core::session::{Session, SessionBuilder};
 use flux_core::transfer::chunker::Chunker;
@@ -371,7 +371,9 @@ async fn test_receiver_resume_from_partial() {
 
     // Write first full chunk to .part
     let part_path = output_dir.join("resume.txt.part");
-    fs::write(&part_path, &full_data[..chunk_size as usize]).await.unwrap();
+    fs::write(&part_path, &full_data[..chunk_size as usize])
+        .await
+        .unwrap();
 
     // Write matching .part.meta
     let state = PartialTransferState {
@@ -399,7 +401,10 @@ async fn test_receiver_resume_from_partial() {
     assert_eq!(receiver.resume_from_chunk(), 1);
 
     // Write the remaining chunk
-    receiver.write_chunk(1, &full_data[chunk_size as usize..]).await.unwrap();
+    receiver
+        .write_chunk(1, &full_data[chunk_size as usize..])
+        .await
+        .unwrap();
 
     // Finalize
     let path = receiver.finalize().await.unwrap();
