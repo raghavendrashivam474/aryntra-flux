@@ -9,7 +9,7 @@
 - [x] S1.6: Multi-File & Directory Transfer
 
 ## Phase 2: Resilience & Optimization
-- [ ] S2.1: Multi-path Discovery
+- [x] S2.1: Multi-path Discovery
 - [ ] S2.2: Path Measurement & Auto-Selection
 - [ ] S2.3: Relay Fallback System
 - [ ] S2.4: Multiplexed / Concurrent Transfers

@@ -32,3 +32,35 @@ Transport (TCP)
 - Local (LAN/Wi-Fi)
 - Direct P2P
 - Relay (Fallback)
+rn
+## Multi-Path Architecture (S2.1)
+
+Flux models peer connectivity using an explicit multi-path abstraction layer:
+
+```text
+                  ┌──────────────┐
+                  │    PeerId    │
+                  └──────┬───────┘
+                         │ 1:N
+                  ┌──────▼───────┐
+                  │   PathSet    │
+                  └──────┬───────┘
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+   ┌───────────┐   ┌───────────┐   ┌───────────┐
+   │  Path A   │   │  Path B   │   │  Path C   │
+   │ (LAN TCP) │   │(Wi-Fi TCP)│   │ (Relay)   │
+   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
+         │               │               │
+         ▼               ▼               ▼
+   ┌───────────┐   ┌───────────┐   ┌───────────┐
+   │  Session  │   │  Session  │   │  Session  │
+   └─────┬─────┘   └───────────┘   └───────────┘
+         │
+         ▼
+   ┌───────────┐
+   │ Transfer  │
+   └───────────┘
+Peer Identity vs Route Identity: PeerId tracks who the node is. PathId tracks a specific route (TransportKind + SocketAddr) to reach them.
+Path Registry: PathRegistry maintains thread-safe collections of candidate paths per peer, updated dynamically via discovery.
+Path States: Discovered -> Candidate -> Connecting -> Available / Unavailable.
