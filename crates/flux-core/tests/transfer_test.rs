@@ -5,11 +5,10 @@ use flux_core::transfer::chunker::Chunker;
 use flux_core::transfer::error::TransferError;
 use flux_core::transfer::metadata::{PartialTransferState, TransferMetadata, DEFAULT_CHUNK_SIZE};
 use flux_core::transfer::receiver::FileReceiver;
-use flux_core::transfer::TransferManager;
-use flux_core::transport::tcp::TcpTransport;
+use flux_core::transfer::{TransferManager, TransferPlan};
+use flux_core::transport::tcp::{TcpConnection, TcpTransport};
 use flux_core::transport::Transport;
 use sha2::{Digest, Sha256};
-use std::net::SocketAddr;
 use std::path::Path;
 use tempfile::tempdir;
 use tokio::fs;
@@ -36,258 +35,74 @@ async fn test_chunker_empty_file() {
     let file_path = tmp.path().join("empty.bin");
     create_test_file(&file_path, 0).await;
 
-    let mut chunker = Chunker::new(&file_path, 1024).await.unwrap();
-    let (cur, tot) = chunker.progress();
-    assert_eq!(tot, 0);
-    assert_eq!(cur, 0);
-
-    let next = chunker.next_chunk().await.unwrap();
-    assert!(next.is_none());
+    let mut chunker = Chunker::new(&file_path, DEFAULT_CHUNK_SIZE).await.unwrap();
+    assert_eq!(chunker.total_chunks(), 0);
+    assert_eq!(chunker.next_chunk().await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn test_chunker_exact_chunk_size() {
     let tmp = tempdir().unwrap();
     let file_path = tmp.path().join("exact.bin");
-    let chunk_size = 1024;
-    create_test_file(&file_path, chunk_size).await;
+    let size = DEFAULT_CHUNK_SIZE as usize;
+    let data = create_test_file(&file_path, size).await;
 
-    let mut chunker = Chunker::new(&file_path, chunk_size as u32).await.unwrap();
-    let (_, tot) = chunker.progress();
-    assert_eq!(tot, 1);
+    let mut chunker = Chunker::new(&file_path, DEFAULT_CHUNK_SIZE).await.unwrap();
+    assert_eq!(chunker.total_chunks(), 1);
 
-    let next = chunker.next_chunk().await.unwrap();
-    assert!(next.is_some());
-    let (idx, data) = next.unwrap();
-    assert_eq!(idx, 0);
-    assert_eq!(data.len(), chunk_size);
+    let (index, chunk) = chunker.next_chunk().await.unwrap().unwrap();
+    assert_eq!(index, 0);
+    assert_eq!(chunk, data);
 
-    assert!(chunker.next_chunk().await.unwrap().is_none());
+    assert_eq!(chunker.next_chunk().await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn test_chunker_exact_plus_one() {
     let tmp = tempdir().unwrap();
-    let file_path = tmp.path().join("plus_one.bin");
-    let chunk_size = 1024;
-    create_test_file(&file_path, chunk_size + 1).await;
+    let file_path = tmp.path().join("exact_plus_one.bin");
+    let size = (DEFAULT_CHUNK_SIZE as usize) + 1;
+    let data = create_test_file(&file_path, size).await;
 
-    let mut chunker = Chunker::new(&file_path, chunk_size as u32).await.unwrap();
-    let (_, tot) = chunker.progress();
-    assert_eq!(tot, 2);
+    let mut chunker = Chunker::new(&file_path, DEFAULT_CHUNK_SIZE).await.unwrap();
+    assert_eq!(chunker.total_chunks(), 2);
 
-    let first = chunker.next_chunk().await.unwrap().unwrap();
-    assert_eq!(first.1.len(), chunk_size);
+    let (index1, chunk1) = chunker.next_chunk().await.unwrap().unwrap();
+    assert_eq!(index1, 0);
+    assert_eq!(chunk1.len(), DEFAULT_CHUNK_SIZE as usize);
+    assert_eq!(chunk1, &data[..DEFAULT_CHUNK_SIZE as usize]);
 
-    let second = chunker.next_chunk().await.unwrap().unwrap();
-    assert_eq!(second.1.len(), 1);
+    let (index2, chunk2) = chunker.next_chunk().await.unwrap().unwrap();
+    assert_eq!(index2, 1);
+    assert_eq!(chunk2.len(), 1);
+    assert_eq!(chunk2, &data[DEFAULT_CHUNK_SIZE as usize..]);
 
-    assert!(chunker.next_chunk().await.unwrap().is_none());
+    assert_eq!(chunker.next_chunk().await.unwrap(), None);
 }
-
-// --- Integrity & Reassembly Tests ---
-
-#[tokio::test]
-async fn test_receiver_happy_path() {
-    let tmp = tempdir().unwrap();
-    let output_dir = tmp.path().join("received");
-
-    let file_data = b"Hello World, Flux File Transfer Rocks!";
-    let hash = compute_hash(file_data);
-    let meta = TransferMetadata::new("hello.txt".to_string(), file_data.len() as u64, hash);
-
-    let mut receiver = FileReceiver::new(meta.clone(), &output_dir).await.unwrap();
-    receiver.write_chunk(0, file_data).await.unwrap();
-
-    let finalized_path = receiver.finalize().await.unwrap();
-    assert!(finalized_path.exists());
-
-    let received_data = fs::read(finalized_path).await.unwrap();
-    assert_eq!(received_data, file_data);
-}
-
-#[tokio::test]
-async fn test_receiver_size_mismatch() {
-    let tmp = tempdir().unwrap();
-    let output_dir = tmp.path().join("received");
-
-    let file_data = b"Some data";
-    let hash = compute_hash(file_data);
-    let meta = TransferMetadata::new(
-        "bad_size.txt".to_string(),
-        file_data.len() as u64 + 10,
-        hash,
-    );
-
-    let mut receiver = FileReceiver::new(meta, &output_dir).await.unwrap();
-    receiver.write_chunk(0, file_data).await.unwrap();
-
-    let result = receiver.finalize().await;
-    assert!(result.is_err());
-    match result {
-        Err(TransferError::SizeMismatch { .. }) => {}
-        other => panic!("Expected SizeMismatch, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn test_receiver_integrity_mismatch() {
-    let tmp = tempdir().unwrap();
-    let output_dir = tmp.path().join("received");
-
-    let file_data = b"Clean data";
-    let corrupted_data = b"Dirty data";
-    let hash = compute_hash(file_data);
-    let meta = TransferMetadata::new(
-        "corrupted.txt".to_string(),
-        corrupted_data.len() as u64,
-        hash,
-    );
-
-    let mut receiver = FileReceiver::new(meta, &output_dir).await.unwrap();
-    receiver.write_chunk(0, corrupted_data).await.unwrap();
-
-    let result = receiver.finalize().await;
-    assert!(result.is_err());
-    match result {
-        Err(TransferError::IntegrityMismatch { .. }) => {}
-        other => panic!("Expected IntegrityMismatch, got {:?}", other),
-    }
-}
-
-#[tokio::test]
-async fn test_receiver_invalid_sequence_index() {
-    let tmp = tempdir().unwrap();
-    let output_dir = tmp.path().join("received");
-
-    let file_data = b"Testing sequence";
-    let hash = compute_hash(file_data);
-    let meta = TransferMetadata::new("out_of_order.txt".to_string(), file_data.len() as u64, hash);
-
-    let mut receiver = FileReceiver::new(meta, &output_dir).await.unwrap();
-    let result = receiver.write_chunk(1, file_data).await; // sending index 1 instead of 0
-    assert!(result.is_err());
-    match result {
-        Err(TransferError::InvalidChunkIndex {
-            expected: 0,
-            actual: 1,
-        }) => {}
-        other => panic!("Expected InvalidChunkIndex, got {:?}", other),
-    }
-}
-
-// --- End-To-End (E2E) Live Transport Transfer Test ---
-
-#[tokio::test]
-async fn test_e2e_tcp_file_transfer() {
-    let tmp = tempdir().unwrap();
-    let sender_dir = tmp.path().join("sender");
-    let receiver_dir = tmp.path().join("receiver");
-    fs::create_dir_all(&sender_dir).await.unwrap();
-    fs::create_dir_all(&receiver_dir).await.unwrap();
-
-    // 1. Create unique, robust payload (150 KB to trigger multiple 64KB chunks)
-    let file_path = sender_dir.join("large_payload.bin");
-    let original_payload = create_test_file(&file_path, 150 * 1024).await;
-
-    // 2. Set up identities
-    let local_peer_id = PeerId::new();
-    let remote_peer_id = PeerId::new();
-
-    // 3. Bind Listener
-    let transport_receiver = TcpTransport::new();
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap(); // Bind to ephemeral port
-    let mut listener = transport_receiver.listen(addr).await.unwrap();
-    let local_addr = listener.local_addr();
-
-    // 4. Run Receiver Loop in Background
-    let remote_id_for_spawn = remote_peer_id.clone();
-    let receiver_dir_for_spawn = receiver_dir.clone();
-    let receiver_handle = tokio::spawn(async move {
-        let (mut conn, _) = listener.accept().await.unwrap();
-
-        // Perform server side handshake
-        if let Some(tcp_conn) = conn
-            .as_any_mut()
-            .downcast_mut::<flux_core::transport::TcpConnection>()
-        {
-            tcp_conn
-                .server_handshake(&remote_id_for_spawn)
-                .await
-                .unwrap();
-        }
-
-        let mut session = Session::from_connection(conn, remote_id_for_spawn);
-
-        // Expect TransferRequest
-        let first_msg = session.recv_message().await.unwrap();
-        if let FluxMessage::TransferRequest { metadata } = first_msg {
-            TransferManager::receive_transfer(&mut session, metadata, &receiver_dir_for_spawn)
-                .await
-                .unwrap();
-        } else {
-            panic!("Expected TransferRequest message!");
-        }
-
-        session.close().await.unwrap();
-    });
-
-    // 5. Connect and Transfer on Sender
-    let transport_sender = TcpTransport::new();
-    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
-    let mut session_sender = session_builder
-        .connect(&remote_peer_id, local_addr)
-        .await
-        .unwrap();
-
-    TransferManager::send_file(&mut session_sender, &file_path)
-        .await
-        .unwrap();
-    session_sender.close().await.unwrap();
-
-    // 6. Wait for receiver to finish execution
-    receiver_handle.await.unwrap();
-
-    // 7. Verify file exists at receiver and is byte-for-byte identical
-    let received_file_path = receiver_dir.join("large_payload.bin");
-    assert!(received_file_path.exists());
-
-    let received_payload = fs::read(received_file_path).await.unwrap();
-    assert_eq!(received_payload, original_payload);
-}
-
-// =========================================================================
-// S1.5 — Transfer Resume & Recovery Tests
-// =========================================================================
-
-// --- Chunker Seek Tests ---
 
 #[tokio::test]
 async fn test_chunker_seek_to_chunk() {
     let tmp = tempdir().unwrap();
     let file_path = tmp.path().join("seek_test.bin");
-    let chunk_size: u32 = 1024;
-    // 4 chunks: 0..1023, 1024..2047, 2048..3071, 3072..4095
-    create_test_file(&file_path, 4096).await;
+    let size = (DEFAULT_CHUNK_SIZE as usize) * 3;
+    let data = create_test_file(&file_path, size).await;
 
-    let mut chunker = Chunker::new(&file_path, chunk_size).await.unwrap();
+    let mut chunker = Chunker::new(&file_path, DEFAULT_CHUNK_SIZE).await.unwrap();
+    assert_eq!(chunker.total_chunks(), 3);
 
-    // Seek to chunk 2 (skip 0 and 1)
+    // Seek to chunk 2 (third chunk)
     chunker.seek_to_chunk(2).await.unwrap();
-    let (cur, _) = chunker.progress();
+    let (cur, tot) = chunker.progress();
     assert_eq!(cur, 2);
+    assert_eq!(tot, 3);
+    assert_eq!(chunker.bytes_read(), (DEFAULT_CHUNK_SIZE as u64) * 2);
 
-    let (idx, data) = chunker.next_chunk().await.unwrap().unwrap();
-    assert_eq!(idx, 2);
-    assert_eq!(data.len(), 1024);
-    // Verify the data starts at byte 2048
-    assert_eq!(data[0], (2048 % 256) as u8);
+    let (index, chunk) = chunker.next_chunk().await.unwrap().unwrap();
+    assert_eq!(index, 2);
+    let expected = &data[(DEFAULT_CHUNK_SIZE as usize) * 2..];
+    assert_eq!(chunk, expected);
 
-    let (idx, data) = chunker.next_chunk().await.unwrap().unwrap();
-    assert_eq!(idx, 3);
-    assert_eq!(data.len(), 1024);
-
-    assert!(chunker.next_chunk().await.unwrap().is_none());
+    assert_eq!(chunker.next_chunk().await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -302,173 +117,112 @@ async fn test_chunker_seek_beyond_end() {
     assert!(chunker.next_chunk().await.unwrap().is_none());
 }
 
-// --- Receiver Resume Unit Tests ---
+// --- Receiver Tests ---
 
 #[tokio::test]
-async fn test_receiver_resume_no_partial_state() {
+async fn test_receiver_happy_path() {
     let tmp = tempdir().unwrap();
-    let output_dir = tmp.path().join("received");
-    fs::create_dir_all(&output_dir).await.unwrap();
+    let out_dir = tmp.path().join("received");
 
-    let file_data = b"No partial state here";
-    let hash = compute_hash(file_data);
-    let meta = TransferMetadata::new("fresh.txt".to_string(), file_data.len() as u64, hash);
+    let size = 100 * 1024; // 100 KB
+    let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+    let hash = compute_hash(&data);
 
-    // No .part or .part.meta exists — should return None
-    let result = FileReceiver::try_resume(meta, &output_dir).await.unwrap();
-    assert!(result.is_none());
+    let meta = TransferMetadata::new("happy.bin".to_string(), size as u64, hash);
+    let mut receiver = FileReceiver::new(meta.clone(), &out_dir).await.unwrap();
+
+    let chunks: Vec<&[u8]> = data.chunks(DEFAULT_CHUNK_SIZE as usize).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        receiver.write_chunk(i as u32, chunk).await.unwrap();
+    }
+
+    let final_path = receiver.finalize().await.unwrap();
+    assert!(final_path.exists());
+    let written = fs::read(&final_path).await.unwrap();
+    assert_eq!(written, data);
 }
 
 #[tokio::test]
-async fn test_receiver_resume_mismatched_state() {
+async fn test_receiver_invalid_sequence_index() {
     let tmp = tempdir().unwrap();
-    let output_dir = tmp.path().join("received");
-    fs::create_dir_all(&output_dir).await.unwrap();
+    let out_dir = tmp.path().join("received");
 
-    let file_data = b"Original file data for testing";
-    let hash = compute_hash(file_data);
-    let meta = TransferMetadata::new("mismatch.txt".to_string(), file_data.len() as u64, hash);
+    let meta = TransferMetadata::new("seq.bin".to_string(), 1000, [0u8; 32]);
+    let mut receiver = FileReceiver::new(meta, &out_dir).await.unwrap();
 
-    // Create a .part file with some data
-    let part_path = output_dir.join("mismatch.txt.part");
-    fs::write(&part_path, b"partial").await.unwrap();
-
-    // Create a .part.meta with WRONG metadata (different sha256)
-    let wrong_state = PartialTransferState {
-        file_name: "mismatch.txt".to_string(),
-        file_size: file_data.len() as u64,
-        chunk_size: 64 * 1024,
-        total_chunks: 1,
-        sha256: [0xFF; 32], // Wrong hash
-        chunks_received: 1,
-        bytes_received: 7,
-    };
-    let meta_bytes = bincode::serialize(&wrong_state).unwrap();
-    fs::write(output_dir.join("mismatch.txt.part.meta"), &meta_bytes)
-        .await
-        .unwrap();
-
-    // Should return None because metadata doesn't match
-    let result = FileReceiver::try_resume(meta, &output_dir).await.unwrap();
-    assert!(result.is_none());
-
-    // Stale files should be cleaned up
-    assert!(!part_path.exists());
+    let res = receiver.write_chunk(1, &[0u8; 100]).await; // Sending 1 instead of 0
+    assert!(matches!(
+        res,
+        Err(TransferError::InvalidChunkIndex {
+            expected: 0,
+            actual: 1
+        })
+    ));
 }
 
 #[tokio::test]
-async fn test_receiver_resume_from_partial() {
+async fn test_receiver_size_mismatch() {
     let tmp = tempdir().unwrap();
-    let output_dir = tmp.path().join("received");
-    fs::create_dir_all(&output_dir).await.unwrap();
+    let out_dir = tmp.path().join("received");
 
-    // Simulate a file with 2 chunks using the official DEFAULT_CHUNK_SIZE
-    let chunk_size: u32 = DEFAULT_CHUNK_SIZE;
-    let file_size: u64 = chunk_size as u64 + 1024; // 1 full chunk + 1KB partial chunk
-    let full_data: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();
-    let hash = compute_hash(&full_data);
-    let meta = TransferMetadata::new("resume.txt".to_string(), file_size, hash);
+    let meta = TransferMetadata::new("size_err.bin".to_string(), 500, [0u8; 32]);
+    let mut receiver = FileReceiver::new(meta, &out_dir).await.unwrap();
 
-    // Write first full chunk to .part
-    let part_path = output_dir.join("resume.txt.part");
-    fs::write(&part_path, &full_data[..chunk_size as usize])
-        .await
-        .unwrap();
+    receiver.write_chunk(0, &[0u8; 100]).await.unwrap();
 
-    // Write matching .part.meta
-    let state = PartialTransferState {
-        file_name: "resume.txt".to_string(),
-        file_size,
-        chunk_size,
-        total_chunks: 2,
-        sha256: hash,
-        chunks_received: 1,
-        bytes_received: chunk_size as u64,
-    };
-    let meta_bytes = bincode::serialize(&state).unwrap();
-    fs::write(output_dir.join("resume.txt.part.meta"), &meta_bytes)
-        .await
-        .unwrap();
-
-    // Resume should succeed
-    let receiver = FileReceiver::try_resume(meta.clone(), &output_dir)
-        .await
-        .unwrap();
-    assert!(receiver.is_some());
-
-    let mut receiver = receiver.unwrap();
-    assert!(receiver.is_resumed());
-    assert_eq!(receiver.resume_from_chunk(), 1);
-
-    // Write the remaining chunk
-    receiver
-        .write_chunk(1, &full_data[chunk_size as usize..])
-        .await
-        .unwrap();
-
-    // Finalize
-    let path = receiver.finalize().await.unwrap();
-    assert!(path.exists());
-
-    let received = fs::read(path).await.unwrap();
-    assert_eq!(received, full_data);
+    let res = receiver.finalize().await;
+    assert!(matches!(
+        res,
+        Err(TransferError::SizeMismatch {
+            expected: 500,
+            actual: 100
+        })
+    ));
 }
 
-// --- E2E Resume Transfer Test ---
+#[tokio::test]
+async fn test_receiver_integrity_mismatch() {
+    let tmp = tempdir().unwrap();
+    let out_dir = tmp.path().join("received");
+
+    let fake_hash = [0xFF; 32];
+    let meta = TransferMetadata::new("corrupt.bin".to_string(), 10, fake_hash);
+    let mut receiver = FileReceiver::new(meta, &out_dir).await.unwrap();
+
+    receiver.write_chunk(0, &[0x00; 10]).await.unwrap();
+
+    let res = receiver.finalize().await;
+    assert!(matches!(res, Err(TransferError::IntegrityMismatch { .. })));
+}
+
+// --- E2E Single File Tests ---
 
 #[tokio::test]
-async fn test_e2e_tcp_resume_transfer() {
-    let tmp = tempdir().unwrap();
-    let sender_dir = tmp.path().join("sender");
-    let receiver_dir = tmp.path().join("receiver");
-    fs::create_dir_all(&sender_dir).await.unwrap();
-    fs::create_dir_all(&receiver_dir).await.unwrap();
+async fn test_e2e_tcp_file_transfer() {
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
 
-    // 1. Create a 200KB test file (4 chunks at 64KB: 3 full + 1 partial)
-    let file_path = sender_dir.join("resume_test.bin");
-    let original_payload = create_test_file(&file_path, 200 * 1024).await;
-    let file_hash = compute_hash(&original_payload);
+    let file_path = sender_dir.path().join("large_payload.bin");
+    let payload_size = 250 * 1024; // 250 KB (4 chunks: 3 full + 1 partial)
+    let original_payload = create_test_file(&file_path, payload_size).await;
 
-    // 2. Simulate interrupted transfer: first 2 chunks already received
-    let chunk_size: u32 = 64 * 1024;
-    let partial_bytes = (2 * chunk_size) as usize;
-    let part_path = receiver_dir.join("resume_test.bin.part");
-    fs::write(&part_path, &original_payload[..partial_bytes])
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
+    let local_addr = listener.local_addr();
 
-    let state = PartialTransferState {
-        file_name: "resume_test.bin".to_string(),
-        file_size: original_payload.len() as u64,
-        chunk_size,
-        total_chunks: 4,
-        sha256: file_hash,
-        chunks_received: 2,
-        bytes_received: partial_bytes as u64,
-    };
-    let meta_bytes = bincode::serialize(&state).unwrap();
-    let meta_path = receiver_dir.join("resume_test.bin.part.meta");
-    fs::write(&meta_path, &meta_bytes).await.unwrap();
-
-    // 3. Set up identities and transport
     let local_peer_id = PeerId::new();
     let remote_peer_id = PeerId::new();
 
-    let transport_receiver = TcpTransport::new();
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut listener = transport_receiver.listen(addr).await.unwrap();
-    let local_addr = listener.local_addr();
-
-    // 4. Receiver in background — should detect partial state and resume
     let remote_id_for_spawn = remote_peer_id.clone();
-    let receiver_dir_for_spawn = receiver_dir.clone();
+    let receiver_dir_for_spawn = receiver_dir.path().to_path_buf();
+
     let receiver_handle = tokio::spawn(async move {
         let (mut conn, _) = listener.accept().await.unwrap();
 
-        if let Some(tcp_conn) = conn
-            .as_any_mut()
-            .downcast_mut::<flux_core::transport::TcpConnection>()
-        {
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
             tcp_conn
                 .server_handshake(&remote_id_for_spawn)
                 .await
@@ -489,7 +243,6 @@ async fn test_e2e_tcp_resume_transfer() {
         session.close().await.unwrap();
     });
 
-    // 5. Sender — should receive TransferResume and skip first 2 chunks
     let transport_sender = TcpTransport::new();
     let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
     let mut session_sender = session_builder
@@ -502,17 +255,458 @@ async fn test_e2e_tcp_resume_transfer() {
         .unwrap();
     session_sender.close().await.unwrap();
 
-    // 6. Wait for receiver
     receiver_handle.await.unwrap();
 
-    // 7. Verify final file is byte-for-byte identical
-    let received_file_path = receiver_dir.join("resume_test.bin");
+    let received_file_path = receiver_dir.path().join("large_payload.bin");
+    assert!(received_file_path.exists());
+
+    let received_payload = fs::read(received_file_path).await.unwrap();
+    assert_eq!(received_payload, original_payload);
+}
+
+// --- Resume Tests ---
+
+#[tokio::test]
+async fn test_receiver_resume_no_partial_state() {
+    let tmp = tempdir().unwrap();
+    let out_dir = tmp.path().join("received");
+
+    let meta = TransferMetadata::new("fresh.bin".to_string(), 1000, [0u8; 32]);
+    let resume_result = FileReceiver::try_resume(meta, &out_dir).await.unwrap();
+    assert!(resume_result.is_none());
+}
+
+#[tokio::test]
+async fn test_receiver_resume_from_partial() {
+    let tmp = tempdir().unwrap();
+    let out_dir = tmp.path().join("received");
+    fs::create_dir_all(&out_dir).await.unwrap();
+
+    let size = (DEFAULT_CHUNK_SIZE as usize) * 3; // 3 chunks
+    let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+    let hash = compute_hash(&data);
+
+    let meta = TransferMetadata::new("interrupted.bin".to_string(), size as u64, hash);
+
+    // Simulate partial state: 2 chunks written
+    let chunks_written = 2u32;
+    let bytes_written = (chunks_written as u64) * (DEFAULT_CHUNK_SIZE as u64);
+    let part_data = &data[..bytes_written as usize];
+
+    let part_path = out_dir.join("interrupted.bin.part");
+    let meta_path = out_dir.join("interrupted.bin.part.meta");
+
+    fs::write(&part_path, part_data).await.unwrap();
+
+    let partial_state = PartialTransferState {
+        file_name: "interrupted.bin".to_string(),
+        file_size: size as u64,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        total_chunks: 3,
+        sha256: hash,
+        chunks_received: chunks_written,
+        bytes_received: bytes_written,
+        relative_path: None,
+    };
+    let encoded_meta = bincode::serialize(&partial_state).unwrap();
+    fs::write(&meta_path, &encoded_meta).await.unwrap();
+
+    let mut receiver = FileReceiver::try_resume(meta.clone(), &out_dir)
+        .await
+        .unwrap()
+        .expect("should find partial state");
+
+    assert!(receiver.is_resumed());
+    assert_eq!(receiver.resume_from_chunk(), 2);
+
+    // Send final chunk (chunk index 2)
+    let last_chunk = &data[(DEFAULT_CHUNK_SIZE as usize) * 2..];
+    receiver.write_chunk(2, last_chunk).await.unwrap();
+
+    let final_path = receiver.finalize().await.unwrap();
+    assert!(final_path.exists());
+    let written = fs::read(&final_path).await.unwrap();
+    assert_eq!(written, data);
+
+    assert!(!part_path.exists());
+    assert!(!meta_path.exists());
+}
+
+#[tokio::test]
+async fn test_receiver_resume_mismatched_state() {
+    let tmp = tempdir().unwrap();
+    let out_dir = tmp.path().join("received");
+    fs::create_dir_all(&out_dir).await.unwrap();
+
+    let part_path = out_dir.join("mismatch.bin.part");
+    let meta_path = out_dir.join("mismatch.bin.part.meta");
+
+    fs::write(&part_path, &[0u8; 100]).await.unwrap();
+
+    let wrong_state = PartialTransferState {
+        file_name: "mismatch.bin".to_string(),
+        file_size: 9999, // Mismatched size
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        total_chunks: 1,
+        sha256: [0xFF; 32],
+        chunks_received: 1,
+        bytes_received: 100,
+        relative_path: None,
+    };
+    let encoded_meta = bincode::serialize(&wrong_state).unwrap();
+    fs::write(&meta_path, &encoded_meta).await.unwrap();
+
+    let meta = TransferMetadata::new("mismatch.bin".to_string(), 1000, [0u8; 32]);
+    let resume_result = FileReceiver::try_resume(meta, &out_dir).await.unwrap();
+    assert!(resume_result.is_none());
+
+    assert!(!part_path.exists());
+    assert!(!meta_path.exists());
+}
+
+#[tokio::test]
+async fn test_e2e_tcp_resume_transfer() {
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    let file_path = sender_dir.path().join("resume_test.bin");
+    let payload_size = 200 * 1024; // 200 KB (4 chunks)
+    let original_payload = create_test_file(&file_path, payload_size).await;
+    let file_hash = compute_hash(&original_payload);
+
+    let chunks_received = 2u32;
+    let bytes_received = (chunks_received as u64) * (DEFAULT_CHUNK_SIZE as u64);
+    let part_data = &original_payload[..bytes_received as usize];
+
+    let part_path = receiver_dir.path().join("resume_test.bin.part");
+    let meta_path = receiver_dir.path().join("resume_test.bin.part.meta");
+
+    fs::write(&part_path, part_data).await.unwrap();
+
+    let partial_state = PartialTransferState {
+        file_name: "resume_test.bin".to_string(),
+        file_size: payload_size as u64,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        total_chunks: (payload_size as u64).div_ceil(DEFAULT_CHUNK_SIZE as u64) as u32,
+        sha256: file_hash,
+        chunks_received,
+        bytes_received,
+        relative_path: None,
+    };
+    let encoded_meta = bincode::serialize(&partial_state).unwrap();
+    fs::write(&meta_path, &encoded_meta).await.unwrap();
+
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    let remote_id_for_spawn = remote_peer_id.clone();
+    let receiver_dir_for_spawn = receiver_dir.path().to_path_buf();
+
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn
+                .server_handshake(&remote_id_for_spawn)
+                .await
+                .unwrap();
+        }
+
+        let mut session = Session::from_connection(conn, remote_id_for_spawn);
+
+        let first_msg = session.recv_message().await.unwrap();
+        if let FluxMessage::TransferRequest { metadata } = first_msg {
+            TransferManager::receive_transfer(&mut session, metadata, &receiver_dir_for_spawn)
+                .await
+                .unwrap();
+        } else {
+            panic!("Expected TransferRequest message!");
+        }
+
+        session.close().await.unwrap();
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender = session_builder
+        .connect(&remote_peer_id, local_addr)
+        .await
+        .unwrap();
+
+    TransferManager::send_file(&mut session_sender, &file_path)
+        .await
+        .unwrap();
+    session_sender.close().await.unwrap();
+
+    receiver_handle.await.unwrap();
+
+    let received_file_path = receiver_dir.path().join("resume_test.bin");
     assert!(received_file_path.exists());
 
     let received_payload = fs::read(received_file_path).await.unwrap();
     assert_eq!(received_payload, original_payload);
 
-    // 8. Verify partial state was cleaned up
+    assert!(!part_path.exists());
+    assert!(!meta_path.exists());
+}
+
+// --- S1.6: Multi-File & Directory Transfer Tests ---
+
+#[tokio::test]
+async fn test_e2e_tcp_multi_file_transfer() {
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    let file1_path = sender_dir.path().join("file1.bin");
+    let payload1 = create_test_file(&file1_path, 1024).await;
+
+    let file2_path = sender_dir.path().join("file2.bin");
+    let payload2 = create_test_file(&file2_path, 150 * 1024).await;
+
+    let file3_path = sender_dir.path().join("file3.bin");
+    let payload3 = create_test_file(&file3_path, 42).await;
+
+    let plan =
+        TransferPlan::from_paths(&[file1_path.clone(), file2_path.clone(), file3_path.clone()])
+            .unwrap();
+    assert_eq!(plan.len(), 3);
+
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    let remote_id_for_spawn = remote_peer_id.clone();
+    let receiver_dir_for_spawn = receiver_dir.path().to_path_buf();
+
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn
+                .server_handshake(&remote_id_for_spawn)
+                .await
+                .unwrap();
+        }
+
+        let mut session = Session::from_connection(conn, remote_id_for_spawn);
+        TransferManager::receive_collection(&mut session, &receiver_dir_for_spawn)
+            .await
+            .unwrap();
+
+        session.close().await.unwrap();
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender = session_builder
+        .connect(&remote_peer_id, local_addr)
+        .await
+        .unwrap();
+
+    TransferManager::send_collection(&mut session_sender, &plan)
+        .await
+        .unwrap();
+    session_sender.close().await.unwrap();
+
+    receiver_handle.await.unwrap();
+
+    for (filename, expected_payload) in [
+        ("file1.bin", &payload1),
+        ("file2.bin", &payload2),
+        ("file3.bin", &payload3),
+    ] {
+        let path = receiver_dir.path().join(filename);
+        assert!(path.exists(), "File {} should exist on receiver", filename);
+        let actual = fs::read(&path).await.unwrap();
+        assert_eq!(&actual, expected_payload);
+    }
+}
+
+#[tokio::test]
+async fn test_e2e_tcp_directory_transfer() {
+    let sender_root = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    let root_file = sender_root.path().join("root_file.txt");
+    let payload_root = create_test_file(&root_file, 500).await;
+
+    let sub_a = sender_root.path().join("subA");
+    fs::create_dir_all(&sub_a).await.unwrap();
+    let nested1 = sub_a.join("nested1.bin");
+    let payload_nested1 = create_test_file(&nested1, 80 * 1024).await;
+
+    let deep_dir = sender_root.path().join("subB").join("deep");
+    fs::create_dir_all(&deep_dir).await.unwrap();
+    let nested2 = deep_dir.join("nested2.bin");
+    let payload_nested2 = create_test_file(&nested2, 1200).await;
+
+    let plan = TransferPlan::from_paths(&[sender_root.path().to_path_buf()]).unwrap();
+    assert_eq!(plan.len(), 3);
+
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    let remote_id_for_spawn = remote_peer_id.clone();
+    let receiver_dir_for_spawn = receiver_dir.path().to_path_buf();
+
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn
+                .server_handshake(&remote_id_for_spawn)
+                .await
+                .unwrap();
+        }
+
+        let mut session = Session::from_connection(conn, remote_id_for_spawn);
+        TransferManager::receive_collection(&mut session, &receiver_dir_for_spawn)
+            .await
+            .unwrap();
+
+        session.close().await.unwrap();
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender = session_builder
+        .connect(&remote_peer_id, local_addr)
+        .await
+        .unwrap();
+
+    TransferManager::send_collection(&mut session_sender, &plan)
+        .await
+        .unwrap();
+    session_sender.close().await.unwrap();
+
+    receiver_handle.await.unwrap();
+
+    let received_root_file = receiver_dir.path().join("root_file.txt");
+    assert!(received_root_file.exists());
+    assert_eq!(fs::read(&received_root_file).await.unwrap(), payload_root);
+
+    let received_nested1 = receiver_dir.path().join("subA").join("nested1.bin");
+    assert!(received_nested1.exists());
+    assert_eq!(fs::read(&received_nested1).await.unwrap(), payload_nested1);
+
+    let received_nested2 = receiver_dir
+        .path()
+        .join("subB")
+        .join("deep")
+        .join("nested2.bin");
+    assert!(received_nested2.exists());
+    assert_eq!(fs::read(&received_nested2).await.unwrap(), payload_nested2);
+}
+
+#[tokio::test]
+async fn test_e2e_tcp_multi_file_resume() {
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    let file1_path = sender_dir.path().join("fresh.bin");
+    let payload1 = create_test_file(&file1_path, 10 * 1024).await;
+
+    let file2_path = sender_dir.path().join("resumed.bin");
+    let payload2 = create_test_file(&file2_path, 150 * 1024).await;
+    let file2_hash = compute_hash(&payload2);
+
+    let plan = TransferPlan::from_paths(&[file1_path.clone(), file2_path.clone()]).unwrap();
+
+    let chunks_received = 2u32;
+    let bytes_received = (chunks_received as u64) * (DEFAULT_CHUNK_SIZE as u64);
+    let part_data = &payload2[..bytes_received as usize];
+
+    let part_path = receiver_dir.path().join("resumed.bin.part");
+    let meta_path = receiver_dir.path().join("resumed.bin.part.meta");
+
+    fs::write(&part_path, part_data).await.unwrap();
+
+    let partial_state = PartialTransferState {
+        file_name: "resumed.bin".to_string(),
+        file_size: payload2.len() as u64,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        total_chunks: (payload2.len() as u64).div_ceil(DEFAULT_CHUNK_SIZE as u64) as u32,
+        sha256: file2_hash,
+        chunks_received,
+        bytes_received,
+        relative_path: Some("resumed.bin".to_string()),
+    };
+    let encoded_meta = bincode::serialize(&partial_state).unwrap();
+    fs::write(&meta_path, &encoded_meta).await.unwrap();
+
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    let remote_id_for_spawn = remote_peer_id.clone();
+    let receiver_dir_for_spawn = receiver_dir.path().to_path_buf();
+
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn
+                .server_handshake(&remote_id_for_spawn)
+                .await
+                .unwrap();
+        }
+
+        let mut session = Session::from_connection(conn, remote_id_for_spawn);
+        TransferManager::receive_collection(&mut session, &receiver_dir_for_spawn)
+            .await
+            .unwrap();
+
+        session.close().await.unwrap();
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender = session_builder
+        .connect(&remote_peer_id, local_addr)
+        .await
+        .unwrap();
+
+    TransferManager::send_collection(&mut session_sender, &plan)
+        .await
+        .unwrap();
+    session_sender.close().await.unwrap();
+
+    receiver_handle.await.unwrap();
+
+    let rec1 = receiver_dir.path().join("fresh.bin");
+    assert!(rec1.exists());
+    assert_eq!(fs::read(&rec1).await.unwrap(), payload1);
+
+    let rec2 = receiver_dir.path().join("resumed.bin");
+    assert!(rec2.exists());
+    assert_eq!(fs::read(&rec2).await.unwrap(), payload2);
+
     assert!(!part_path.exists());
     assert!(!meta_path.exists());
 }
