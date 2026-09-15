@@ -4,7 +4,7 @@ use flux_core::{
     node::FluxNode,
     protocol::FluxMessage,
     session::{Session, SessionBuilder},
-    transfer::TransferManager,
+    transfer::{TransferManager, TransferPlan},
     transport::{TcpConnection, TcpTransport, Transport},
 };
 use std::net::SocketAddr;
@@ -48,15 +48,15 @@ enum Commands {
         message: String,
     },
 
-    /// Send a file to a peer
+    /// Send files and/or directories to a peer
     Send {
         /// Peer address (IP:PORT)
         #[arg(short, long)]
         addr: String,
 
-        /// Path to the file to send
-        #[arg(short, long)]
-        file: String,
+        /// Paths to files and/or directories to send
+        #[arg(short, long, num_args = 1..)]
+        files: Vec<PathBuf>,
     },
 
     /// Health check
@@ -162,9 +162,12 @@ async fn main() -> anyhow::Result<()> {
                                 }
 
                                 Ok(FluxMessage::TransferRequest { metadata }) => {
-                                    println!("Transfer request: {}", metadata.file_name);
+                                    println!("Initial transfer request: {}", metadata.file_name);
                                     let mut session = Session::from_connection(conn, local_peer_id);
                                     let output_dir = PathBuf::from("received");
+
+                                    // Initiate collection receiving loop. It automatically process the pre-received
+                                    // request metadata as the first item before loop-receiving other sequential items.
                                     match TransferManager::receive_transfer(
                                         &mut session,
                                         metadata,
@@ -172,9 +175,24 @@ async fn main() -> anyhow::Result<()> {
                                     )
                                     .await
                                     {
-                                        Ok(()) => println!("Transfer complete\n"),
+                                        Ok(()) => {
+                                            println!("First transfer complete. Awaiting additional collection items...");
+                                            match TransferManager::receive_collection(
+                                                &mut session,
+                                                &output_dir,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => println!(
+                                                    "Collection transfer completed successfully!\n"
+                                                ),
+                                                Err(e) => {
+                                                    eprintln!("Collection transfer failed: {}\n", e)
+                                                }
+                                            }
+                                        }
                                         Err(e) => {
-                                            eprintln!("Transfer failed: {}\n", e)
+                                            eprintln!("First transfer failed: {}\n", e);
                                         }
                                     }
                                     let _ = session.close().await;
@@ -260,7 +278,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Done!");
         }
 
-        Some(Commands::Send { addr, file }) => {
+        Some(Commands::Send { addr, files }) => {
             println!("Aryntra Flux - Send Mode");
             println!(
                 "Profile: {}",
@@ -272,13 +290,16 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("Identity: {}", node.identity);
             println!("Target: {}", addr);
-            println!("File: {}\n", file);
+            println!("Files/Directories count: {}\n", files.len());
 
-            let file_path = PathBuf::from(file);
-            if !file_path.exists() {
-                eprintln!("File not found: {}", file_path.display());
-                return Ok(());
-            }
+            // Build deterministic plan from targets
+            let plan = match TransferPlan::from_paths(files) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to prepare transfer collection: {}", e);
+                    return Ok(());
+                }
+            };
 
             let transport = TcpTransport::new();
             let target_addr: SocketAddr = addr.parse()?;
@@ -293,9 +314,9 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Connected!\n");
 
-            match TransferManager::send_file(&mut session, &file_path).await {
-                Ok(()) => println!("\nTransfer successful!"),
-                Err(e) => eprintln!("\nTransfer failed: {}", e),
+            match TransferManager::send_collection(&mut session, &plan).await {
+                Ok(()) => println!("\nTransfer collection successful!"),
+                Err(e) => eprintln!("\nTransfer collection failed: {}", e),
             }
 
             session.close().await?;
