@@ -1,4 +1,5 @@
 use crate::identity::PeerId;
+use crate::path::{Path, PathRegistry, TransportKind};
 use crate::peer::{Peer, PeerRegistry};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -7,8 +8,13 @@ use std::time::{Duration, Instant};
 
 pub const SERVICE_TYPE: &str = "_flux._udp.local.";
 pub const BROADCAST_PORT: u16 = 9001;
+pub const DEFAULT_TCP_PORT: u16 = 9000;
 
-pub fn start_discovery(peer_id: PeerId, registry: PeerRegistry) -> anyhow::Result<()> {
+pub fn start_discovery(
+    peer_id: PeerId,
+    registry: PeerRegistry,
+    path_registry: PathRegistry,
+) -> anyhow::Result<()> {
     // --- 1. mDNS (Standard Discovery) ---
     let mdns = ServiceDaemon::new()?;
     let service_name = format!("{}.{}", peer_id, SERVICE_TYPE);
@@ -17,7 +23,7 @@ pub fn start_discovery(peer_id: PeerId, registry: PeerRegistry) -> anyhow::Resul
         &peer_id.to_string(),
         &service_name,
         "",
-        9000,
+        DEFAULT_TCP_PORT,
         None,
     )?;
     mdns.register(my_info)?;
@@ -25,6 +31,7 @@ pub fn start_discovery(peer_id: PeerId, registry: PeerRegistry) -> anyhow::Resul
 
     let p_id = peer_id.clone();
     let reg = registry.clone();
+    let path_reg = path_registry.clone();
     tokio::spawn(async move {
         while let Ok(event) = receiver.recv_async().await {
             if let ServiceEvent::ServiceResolved(info) = event {
@@ -32,16 +39,27 @@ pub fn start_discovery(peer_id: PeerId, registry: PeerRegistry) -> anyhow::Resul
                 if id_str != p_id.to_string() {
                     if let Ok(found_id) = serde_json::from_str::<PeerId>(&format!("\"{}\"", id_str))
                     {
+                        // 1. Maintain backward compatibility (PeerRegistry)
+                        let primary_addr = info
+                            .get_addresses()
+                            .iter()
+                            .next()
+                            .map(|a| a.to_string())
+                            .unwrap_or_default();
+
                         reg.update(Peer {
-                            id: found_id,
-                            address: info
-                                .get_addresses()
-                                .iter()
-                                .next()
-                                .map(|a| a.to_string())
-                                .unwrap_or_default(),
+                            id: found_id.clone(),
+                            address: primary_addr,
                             last_seen: Instant::now(),
                         });
+
+                        // 2. Multi-path Support: Record every address as a path
+                        let port = info.get_port();
+                        for ip in info.get_addresses() {
+                            let socket_addr = SocketAddr::new(*ip, port);
+                            let path = Path::new(found_id.clone(), TransportKind::Tcp, socket_addr);
+                            path_reg.register_path(path);
+                        }
                     }
                 }
             }
@@ -77,6 +95,7 @@ pub fn start_discovery(peer_id: PeerId, registry: PeerRegistry) -> anyhow::Resul
     let rx_socket: UdpSocket = socket.into();
     rx_socket.set_nonblocking(true)?;
 
+    let path_reg_udp = path_registry.clone();
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         loop {
@@ -85,11 +104,17 @@ pub fn start_discovery(peer_id: PeerId, registry: PeerRegistry) -> anyhow::Resul
                 if id_str != peer_id.to_string() {
                     if let Ok(found_id) = serde_json::from_str::<PeerId>(&format!("\"{}\"", id_str))
                     {
+                        // 1. Maintain backward compatibility (PeerRegistry)
                         registry.update(Peer {
-                            id: found_id,
+                            id: found_id.clone(),
                             address: addr.ip().to_string(),
                             last_seen: Instant::now(),
                         });
+
+                        // 2. Multi-path Support: Register UDP sender as a Tcp candidate path
+                        let tcp_addr = SocketAddr::new(addr.ip(), DEFAULT_TCP_PORT);
+                        let path = Path::new(found_id.clone(), TransportKind::Tcp, tcp_addr);
+                        path_reg_udp.register_path(path);
                     }
                 }
             }
