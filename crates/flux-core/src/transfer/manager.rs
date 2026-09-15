@@ -1,4 +1,5 @@
 use super::chunker::Chunker;
+use super::collection::TransferPlan;
 use super::error::{Result, TransferError};
 use super::metadata::TransferMetadata;
 use super::receiver::FileReceiver;
@@ -25,8 +26,17 @@ impl TransferManager {
         Ok(hasher.finalize().into())
     }
 
-    /// Send a file through an established session.
+    /// Send a single file over an established session.
     pub async fn send_file(session: &mut Session, file_path: &Path) -> Result<()> {
+        Self::send_file_internal(session, file_path, None).await
+    }
+
+    /// Internal implementation of single-file sending supporting optional relative paths.
+    async fn send_file_internal(
+        session: &mut Session,
+        file_path: &Path,
+        relative_path: Option<String>,
+    ) -> Result<()> {
         let file_name = file_path
             .file_name()
             .ok_or_else(|| TransferError::InvalidFilename("no filename".to_string()))?
@@ -35,10 +45,18 @@ impl TransferManager {
 
         let file_size = tokio::fs::metadata(file_path).await?.len();
         let sha256 = Self::hash_file(file_path).await?;
-        let metadata = TransferMetadata::new(file_name, file_size, sha256);
+        let mut metadata = TransferMetadata::new(file_name, file_size, sha256);
+
+        if let Some(rel) = relative_path {
+            metadata = metadata.with_relative_path(rel);
+        }
 
         println!("Preparing transfer...");
-        println!("  File:   {}", metadata.file_name);
+        if let Some(ref rel) = metadata.relative_path {
+            println!("  Path:   {}", rel);
+        } else {
+            println!("  File:   {}", metadata.file_name);
+        }
         println!("  Size:   {} bytes", metadata.file_size);
         println!("  Chunks: {}", metadata.total_chunks);
         println!("  SHA256: {}", hex_encode(&metadata.sha256));
@@ -142,6 +160,29 @@ impl TransferManager {
         }
     }
 
+    /// Orchestrate sending a complete collection sequentially over a single session.
+    pub async fn send_collection(session: &mut Session, plan: &TransferPlan) -> Result<()> {
+        let total = plan.items.len();
+        println!("Starting transfer of collection ({} items)...", total);
+
+        for (idx, item) in plan.items.iter().enumerate() {
+            println!("\n[{}/{}] Sending file...", idx + 1, total);
+            let relative_str = item.relative_path.to_string_lossy().to_string();
+
+            if let Err(e) =
+                Self::send_file_internal(session, &item.source_path, Some(relative_str)).await
+            {
+                eprintln!("\nError sending item {}: {}", item.source_path.display(), e);
+                return Err(e);
+            }
+        }
+
+        // Send collection completion signal over the session
+        println!("\nCollection transfer complete. Sending termination handshake...");
+        session.send_message(&FluxMessage::Goodbye).await?;
+        Ok(())
+    }
+
     /// Handle an incoming transfer. The caller has already received the
     /// TransferRequest and passes the extracted metadata here.
     pub async fn receive_transfer(
@@ -150,7 +191,11 @@ impl TransferManager {
         output_dir: &Path,
     ) -> Result<()> {
         println!("\n  Incoming transfer:");
-        println!("    File:   {}", metadata.file_name);
+        if let Some(ref rel) = metadata.relative_path {
+            println!("    Path:   {}", rel);
+        } else {
+            println!("    File:   {}", metadata.file_name);
+        }
         println!("    Size:   {} bytes", metadata.file_size);
         println!("    Chunks: {}", metadata.total_chunks);
 
@@ -253,6 +298,39 @@ impl TransferManager {
                 Err(e)
             }
         }
+    }
+
+    /// Run the receiver-side loop over an established session, accepting
+    /// consecutive file transfers until a Goodbye message is received or the session closes.
+    pub async fn receive_collection(session: &mut Session, output_dir: &Path) -> Result<()> {
+        println!("Ready to receive collection...");
+        loop {
+            let msg = match session.recv_message().await {
+                Ok(m) => m,
+                Err(e) => {
+                    // Graceful exit on EOF / connection drops
+                    println!("Connection closed or ended: {}", e);
+                    break;
+                }
+            };
+
+            match msg {
+                FluxMessage::TransferRequest { metadata } => {
+                    Self::receive_transfer(session, metadata, output_dir).await?;
+                }
+                FluxMessage::Goodbye => {
+                    println!("Goodbye received. Collection transfer completed successfully.");
+                    break;
+                }
+                other => {
+                    return Err(TransferError::UnexpectedMessage(format!(
+                        "Expected TransferRequest or Goodbye during collection, got {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

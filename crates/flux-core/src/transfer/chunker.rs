@@ -69,6 +69,10 @@ impl Chunker {
         (self.current_index, self.total_chunks)
     }
 
+    pub fn total_chunks(&self) -> u32 {
+        self.total_chunks
+    }
+
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read
     }
