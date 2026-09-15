@@ -17,4 +17,6 @@ pub use session::{Session, SessionBuilder, SessionState};
 
 // S1.4: File transfer
 pub mod transfer;
-pub use transfer::{TransferId, TransferManager, TransferMetadata};
+pub use transfer::{
+    CollectionError, TransferId, TransferItem, TransferManager, TransferMetadata, TransferPlan,
+};
