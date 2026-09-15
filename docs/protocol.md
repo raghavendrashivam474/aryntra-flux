@@ -25,10 +25,10 @@ Prior to establishing an active communication channel, peers execute a two-way i
 - **HelloAck (Type: HelloAck)**: `version: u16`, `peer_id: PeerId` (server response).
 - **Ping (Type: Ping)**: `sequence: u32`, `payload: String` (test transmission).
 - **Pong (Type: Pong)**: `sequence: u32`, `payload: String` (test echo).
-- **Goodbye (Type: Goodbye)**: Graceful close notification.
+- **Goodbye (Type: Goodbye)**: Graceful close notification. In S1.6, this is also sent by the client to signal the graceful end of a sequential transfer collection.
 
-### File Transfer Messages (S1.4)
-- **TransferRequest (Type: TransferRequest)**: `metadata: TransferMetadata` (sender initiates file transfer with file name, size, chunk count, SHA-256).
+### File Transfer Messages (S1.4 + S1.6 Relative Paths)
+- **TransferRequest (Type: TransferRequest)**: `metadata: TransferMetadata` (sender initiates file transfer with file name, size, chunk count, SHA-256, and optional S1.6 `relative_path: Option<String>`).
 - **TransferAccept (Type: TransferAccept)**: `transfer_id: TransferId` (receiver confirms willingness to receive).
 - **TransferReject (Type: TransferReject)**: `transfer_id: TransferId`, `reason: String` (receiver declines transfer).
 - **TransferChunk (Type: TransferChunk)**: `transfer_id: TransferId`, `index: u32`, `data: Vec<u8>` (carries one 64 KiB chunk with explicit sequence index).
@@ -38,7 +38,33 @@ Prior to establishing an active communication channel, peers execute a two-way i
 ### Transfer Resume Messages (S1.5)
 - **TransferResume (Type: TransferResume)**: `transfer_id: TransferId`, `resume_from_chunk: u32` (receiver informs sender of existing partial state and the chunk index to resume from; sent instead of TransferAccept when valid partial state exists).
 
-## 6. Ports and Addresses
-- **mDNS Service discovery**: `_flux._udp.local.` (Port: 9000)
-- **UDP Heartbeat Fallback**: Broadcast (Port: 9001)
-- **Direct TCP Connection**: Communication port (Port: 9002)
+## 6. S1.6 Collection Flow
+Multi-file and directory transfers reuse the established session sequentially:
+```text
+Client                                                     Server
+  │                                                          │
+  ├─────────────── TransferRequest (File 1) ────────────────>│
+  │                                                          │
+  │<─────────────── TransferAccept / Resume ─────────────────┤
+  │                                                          │
+  ├─────────────── TransferChunk (0..N) ────────────────────>│
+  │                                                          │
+  ├─────────────── TransferComplete ────────────────────────>│
+  │                                                          │
+  │<─────────────── TransferResult ──────────────────────────┤
+  │                                                          │
+  │         [Session Reused for Consecutive Items]           │
+  │                                                          │
+  ├─────────────── TransferRequest (File 2) ────────────────>│
+  │                                                          │
+  │                        ...                               │
+  │                                                          │
+  ├─────────────── Goodbye (Collection End) ────────────────>│
+  ▼                                                          ▼
+```
+
+## 7. Ports and Addresses
+
+- mDNS Service discovery: _flux._udp.local. (Port: 9000)
+- UDP Heartbeat Fallback: Broadcast (Port: 9001)
+- Direct TCP Connection: Communication port (Port: 9002)
