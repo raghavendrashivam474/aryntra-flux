@@ -1,7 +1,11 @@
-pub mod discovery;
+﻿pub mod discovery;
 pub mod identity;
 pub mod node;
 pub mod peer;
+
+// S2.1: Multi-path connectivity
+pub mod path;
+pub use path::{Path, PathId, PathRegistry, PathSet, PathState, TransportKind};
 
 // S1.3: Transport abstraction
 pub mod transport;
