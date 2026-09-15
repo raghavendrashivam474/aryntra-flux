@@ -13,6 +13,8 @@ pub struct TransferMetadata {
     pub chunk_size: u32,
     pub total_chunks: u32,
     pub sha256: [u8; 32],
+    /// S1.6 relative path for reconstructing nested directory structures
+    pub relative_path: Option<String>,
 }
 
 impl TransferMetadata {
@@ -27,7 +29,14 @@ impl TransferMetadata {
             chunk_size,
             total_chunks,
             sha256,
+            relative_path: None,
         }
+    }
+
+    /// Builder method to associate a relative path with the transfer metadata.
+    pub fn with_relative_path(mut self, path: String) -> Self {
+        self.relative_path = Some(path);
+        self
     }
 }
 
@@ -42,6 +51,8 @@ pub struct PartialTransferState {
     pub sha256: [u8; 32],
     pub chunks_received: u32,
     pub bytes_received: u64,
+    /// S1.6 relative path for matching partial state
+    pub relative_path: Option<String>,
 }
 
 impl PartialTransferState {
@@ -52,5 +63,6 @@ impl PartialTransferState {
             && self.chunk_size == metadata.chunk_size
             && self.total_chunks == metadata.total_chunks
             && self.sha256 == metadata.sha256
+            && self.relative_path == metadata.relative_path
     }
 }

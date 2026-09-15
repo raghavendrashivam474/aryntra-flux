@@ -1,4 +1,4 @@
-use super::error::{Result, TransferError};
+﻿use super::error::{Result, TransferError};
 use super::metadata::{PartialTransferState, TransferMetadata};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -19,13 +19,12 @@ pub struct FileReceiver {
 impl FileReceiver {
     /// Create a new receiver for a fresh transfer.
     pub async fn new(metadata: TransferMetadata, output_dir: &Path) -> Result<Self> {
-        let safe_name = sanitize_filename(&metadata.file_name)?;
+        let (final_path, temp_path, meta_path) = get_paths(&metadata, output_dir)?;
 
-        fs::create_dir_all(output_dir).await?;
-
-        let final_path = output_dir.join(&safe_name);
-        let temp_path = output_dir.join(format!("{}.part", safe_name));
-        let meta_path = output_dir.join(format!("{}.part.meta", safe_name));
+        // Ensure the enclosing directory and any parent directories exist
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
 
         // Clean up any stale partial state
         if temp_path.exists() {
@@ -52,13 +51,10 @@ impl FileReceiver {
     /// Attempt to create a receiver that resumes from existing partial state.
     /// Returns `None` if no valid partial state exists for this transfer.
     pub async fn try_resume(metadata: TransferMetadata, output_dir: &Path) -> Result<Option<Self>> {
-        let safe_name = match sanitize_filename(&metadata.file_name) {
-            Ok(n) => n,
+        let (final_path, temp_path, meta_path) = match get_paths(&metadata, output_dir) {
+            Ok(paths) => paths,
             Err(_) => return Ok(None),
         };
-
-        let temp_path = output_dir.join(format!("{}.part", safe_name));
-        let meta_path = output_dir.join(format!("{}.part.meta", safe_name));
 
         // Both files must exist
         if !temp_path.exists() || !meta_path.exists() {
@@ -113,7 +109,7 @@ impl FileReceiver {
         Ok(Some(Self {
             temp_path,
             meta_path,
-            final_path: output_dir.join(&safe_name),
+            final_path,
             file: Some(file),
             metadata,
             bytes_received: state.bytes_received,
@@ -167,6 +163,7 @@ impl FileReceiver {
             sha256: self.metadata.sha256,
             chunks_received: self.chunks_received,
             bytes_received: self.bytes_received,
+            relative_path: self.metadata.relative_path.clone(),
         };
 
         let encoded = bincode::serialize(&state).map_err(|e| {
@@ -221,6 +218,32 @@ impl FileReceiver {
     pub fn progress(&self) -> (u32, u32) {
         (self.chunks_received, self.metadata.total_chunks)
     }
+}
+
+/// Helper function to resolve absolute paths and output targets safely.
+fn get_paths(
+    metadata: &TransferMetadata,
+    output_dir: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let safe_relative_path = if let Some(ref rel_path) = metadata.relative_path {
+        super::collection::sanitize_relative_path(Path::new(rel_path))
+            .map_err(|e| TransferError::InvalidFilename(e.to_string()))?
+    } else {
+        let safe_name = sanitize_filename(&metadata.file_name)?;
+        PathBuf::from(safe_name)
+    };
+
+    let final_path = output_dir.join(&safe_relative_path);
+    let parent_dir = final_path.parent().unwrap_or(output_dir);
+    let file_name_part = final_path
+        .file_name()
+        .ok_or_else(|| TransferError::InvalidFilename("invalid filename".to_string()))?
+        .to_string_lossy();
+
+    let temp_path = parent_dir.join(format!("{}.part", file_name_part));
+    let meta_path = parent_dir.join(format!("{}.part.meta", file_name_part));
+
+    Ok((final_path, temp_path, meta_path))
 }
 
 /// Hash a file from disk using SHA-256.
