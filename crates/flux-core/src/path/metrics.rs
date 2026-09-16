@@ -10,6 +10,8 @@ pub struct PathMetrics {
     pub rtt_ms: Option<u64>,
     /// Timestamp when this path was last probed.
     pub last_probed: Option<Instant>,
+    /// Number of consecutive probe failures since last success.
+    pub consecutive_failures: u32,
 }
 
 impl PathMetrics {
@@ -18,6 +20,7 @@ impl PathMetrics {
         Self {
             rtt_ms: None,
             last_probed: None,
+            consecutive_failures: 0,
         }
     }
 
@@ -26,12 +29,21 @@ impl PathMetrics {
         Self {
             rtt_ms: Some(rtt.as_millis() as u64),
             last_probed: Some(Instant::now()),
+            consecutive_failures: 0,
         }
     }
 
     /// Update with a newly measured round-trip time.
+    /// Resets consecutive failure count on success.
     pub fn update_rtt(&mut self, rtt: Duration) {
         self.rtt_ms = Some(rtt.as_millis() as u64);
+        self.last_probed = Some(Instant::now());
+        self.consecutive_failures = 0;
+    }
+
+    /// Record a probe failure without erasing last known RTT.
+    pub fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
         self.last_probed = Some(Instant::now());
     }
 
@@ -56,6 +68,7 @@ mod tests {
         let metrics = PathMetrics::new();
         assert_eq!(metrics.rtt_ms, None);
         assert_eq!(metrics.last_probed, None);
+        assert_eq!(metrics.consecutive_failures, 0);
         assert_eq!(metrics.rtt(), None);
     }
 
@@ -65,6 +78,7 @@ mod tests {
         metrics.update_rtt(Duration::from_millis(15));
         assert_eq!(metrics.rtt_ms, Some(15));
         assert!(metrics.last_probed.is_some());
+        assert_eq!(metrics.consecutive_failures, 0);
         assert_eq!(metrics.rtt(), Some(Duration::from_millis(15)));
 
         metrics.update_rtt(Duration::from_millis(5));
@@ -76,5 +90,25 @@ mod tests {
         let metrics = PathMetrics::with_rtt(Duration::from_millis(42));
         assert_eq!(metrics.rtt_ms, Some(42));
         assert!(metrics.last_probed.is_some());
+        assert_eq!(metrics.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn test_path_metrics_failure_tracking() {
+        let mut metrics = PathMetrics::with_rtt(Duration::from_millis(10));
+        assert_eq!(metrics.consecutive_failures, 0);
+
+        metrics.record_failure();
+        assert_eq!(metrics.consecutive_failures, 1);
+        // RTT preserved after failure
+        assert_eq!(metrics.rtt_ms, Some(10));
+
+        metrics.record_failure();
+        assert_eq!(metrics.consecutive_failures, 2);
+
+        // Success resets failure count
+        metrics.update_rtt(Duration::from_millis(12));
+        assert_eq!(metrics.consecutive_failures, 0);
+        assert_eq!(metrics.rtt_ms, Some(12));
     }
 }

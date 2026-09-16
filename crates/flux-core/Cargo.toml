@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "flux-core"
 version = "0.1.0"
 edition = "2021"
@@ -21,6 +21,7 @@ thiserror = "1.0"
 
 # S1.4 File transfer dependencies
 sha2 = "0.10"
+futures = "0.3.34"
 
 [dev-dependencies]
 tempfile = "3.8"
