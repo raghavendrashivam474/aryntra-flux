@@ -1,15 +1,23 @@
-﻿use crate::identity::PeerId;
+use crate::identity::PeerId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+pub mod metrics;
+pub mod prober;
+pub mod selector;
+pub use selector::PathSelector;
+
+pub use metrics::PathMetrics;
+pub use prober::{PathProber, ProberError};
 
 // ─── Path Identity ───────────────────────────────────────────
 
 /// Unique identifier for a communication path.
 /// Distinct from PeerId: one peer can have many paths.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PathId(Uuid);
 
 impl PathId {
@@ -74,6 +82,7 @@ pub struct Path {
     pub remote_addr: SocketAddr,
     pub state: PathState,
     pub last_seen: Instant,
+    pub metrics: Option<PathMetrics>,
 }
 
 impl Path {
@@ -86,6 +95,7 @@ impl Path {
             remote_addr,
             state: PathState::Discovered,
             last_seen: Instant::now(),
+            metrics: None,
         }
     }
 
@@ -101,6 +111,22 @@ impl Path {
     pub fn set_state(&mut self, state: PathState) {
         self.state = state;
         self.last_seen = Instant::now();
+    }
+
+    /// Update metrics, refreshing last_seen.
+    pub fn update_metrics(&mut self, metrics: PathMetrics) {
+        self.metrics = Some(metrics);
+        self.last_seen = Instant::now();
+    }
+
+    /// Check if this path has exceeded a given Time-To-Live duration.
+    pub fn is_stale(&self, ttl: Duration) -> bool {
+        self.is_stale_at(Instant::now(), ttl)
+    }
+
+    /// Check if this path was stale at a specific instant.
+    pub fn is_stale_at(&self, now: Instant, ttl: Duration) -> bool {
+        now.saturating_duration_since(self.last_seen) > ttl
     }
 }
 
@@ -155,6 +181,31 @@ impl PathSet {
             path.set_state(state);
         }
     }
+
+    /// Update metrics for a specific path ID inside this set.
+    pub fn update_metrics(&mut self, id: &PathId, metrics: PathMetrics) {
+        if let Some(path) = self.paths.iter_mut().find(|p| &p.id == id) {
+            path.update_metrics(metrics);
+        }
+    }
+
+    /// Expire paths whose `last_seen` exceeds `ttl` by marking them `Unavailable`.
+    /// Returns the number of paths transitioned to Unavailable.
+    pub fn expire_stale(&mut self, ttl: Duration) -> usize {
+        self.expire_stale_at(Instant::now(), ttl)
+    }
+
+    /// Expire paths against a reference timestamp.
+    pub fn expire_stale_at(&mut self, now: Instant, ttl: Duration) -> usize {
+        let mut count = 0;
+        for path in &mut self.paths {
+            if path.state != PathState::Unavailable && path.is_stale_at(now, ttl) {
+                path.state = PathState::Unavailable;
+                count += 1;
+            }
+        }
+        count
+    }
 }
 
 // ─── PathRegistry ────────────────────────────────────────────
@@ -202,6 +253,30 @@ impl PathRegistry {
             set.set_state(path_id, state);
         }
     }
+
+    /// Update metrics for a specific path of a specific peer.
+    pub fn set_path_metrics(&self, peer_id: &PeerId, path_id: &PathId, metrics: PathMetrics) {
+        let mut map = self.paths.write().unwrap();
+        if let Some(set) = map.get_mut(peer_id) {
+            set.update_metrics(path_id, metrics);
+        }
+    }
+
+    /// Mark all paths across all peers that exceed `ttl` as `Unavailable`.
+    /// Returns the total number of expired paths.
+    pub fn expire_stale_paths(&self, ttl: Duration) -> usize {
+        self.expire_stale_paths_at(Instant::now(), ttl)
+    }
+
+    /// Mark all stale paths against a reference timestamp.
+    pub fn expire_stale_paths_at(&self, now: Instant, ttl: Duration) -> usize {
+        let mut map = self.paths.write().unwrap();
+        let mut total = 0;
+        for set in map.values_mut() {
+            total += set.expire_stale_at(now, ttl);
+        }
+        total
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────
@@ -219,7 +294,6 @@ mod tests {
         let peer = PeerId::new();
         let p1 = Path::new(peer.clone(), TransportKind::Tcp, test_addr(9001));
         let p2 = Path::new(peer.clone(), TransportKind::Tcp, test_addr(9002));
-        // Same peer, different paths
         assert_ne!(p1.id, p2.id);
         assert_eq!(p1.peer_id, p2.peer_id);
     }
@@ -278,7 +352,6 @@ mod tests {
 
         p1.set_state(PathState::Available);
         p2.set_state(PathState::Available);
-        // p3 stays Discovered
 
         set.add_or_update(p1);
         set.add_or_update(p2);
@@ -298,7 +371,6 @@ mod tests {
         set.add_or_update(p);
         assert_eq!(set.list()[0].state, PathState::Unavailable);
 
-        // Re-discovering the same route should revive it
         let p2 = Path::new(peer.clone(), TransportKind::Tcp, test_addr(9001));
         set.add_or_update(p2);
         assert_eq!(set.count(), 1, "Should not duplicate");
@@ -338,7 +410,6 @@ mod tests {
 
     #[test]
     fn test_single_path_backward_compat() {
-        // The one-peer-one-path case must work identically
         let registry = PathRegistry::new();
         let peer = PeerId::new();
         registry.register_path(Path::new(peer.clone(), TransportKind::Tcp, test_addr(9001)));
@@ -353,5 +424,67 @@ mod tests {
         let registry = PathRegistry::new();
         let ghost = PeerId::new();
         assert!(registry.get_paths(&ghost).is_none());
+    }
+
+    #[test]
+    fn test_path_metrics_integration() {
+        let registry = PathRegistry::new();
+        let peer = PeerId::new();
+        let path = Path::new(peer.clone(), TransportKind::Tcp, test_addr(9001));
+        let path_id = path.id.clone();
+        registry.register_path(path);
+
+        let paths = registry.get_paths(&peer).unwrap();
+        assert!(paths.get(&path_id).unwrap().metrics.is_none());
+
+        let metrics = PathMetrics::with_rtt(Duration::from_millis(8));
+        registry.set_path_metrics(&peer, &path_id, metrics);
+
+        let paths = registry.get_paths(&peer).unwrap();
+        let retrieved_metrics = paths.get(&path_id).unwrap().metrics.unwrap();
+        assert_eq!(retrieved_metrics.rtt_ms, Some(8));
+        assert!(retrieved_metrics.last_probed.is_some());
+    }
+
+    #[test]
+    fn test_stale_path_detection() {
+        let registry = PathRegistry::new();
+        let peer = PeerId::new();
+
+        let mut path1 = Path::new(peer.clone(), TransportKind::Tcp, test_addr(9001));
+        let mut path2 = Path::new(peer.clone(), TransportKind::Tcp, test_addr(9002));
+
+        let t0 = Instant::now();
+
+        path1.state = PathState::Available;
+        path1.last_seen = t0;
+
+        path2.state = PathState::Available;
+        path2.last_seen = t0 + Duration::from_secs(10);
+
+        let p1_id = path1.id.clone();
+        let p2_id = path2.id.clone();
+
+        registry.register_path(path1);
+        registry.register_path(path2);
+
+        // Advance simulated time to t0 + 7 seconds with a 5-second TTL
+        let check_time = t0 + Duration::from_secs(7);
+        let ttl = Duration::from_secs(5);
+
+        let expired = registry.expire_stale_paths_at(check_time, ttl);
+        assert_eq!(expired, 1, "Exactly 1 stale path should have expired");
+
+        let paths = registry.get_paths(&peer).unwrap();
+        assert_eq!(
+            paths.get(&p1_id).unwrap().state,
+            PathState::Unavailable,
+            "Path 1 (seen at t0) should be Unavailable"
+        );
+        assert_eq!(
+            paths.get(&p2_id).unwrap().state,
+            PathState::Available,
+            "Path 2 (seen at t0+10s) should remain Available"
+        );
     }
 }
