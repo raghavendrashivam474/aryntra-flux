@@ -1,4 +1,4 @@
-﻿use crate::identity::PeerId;
+use crate::identity::PeerId;
 use crate::path::metrics::PathMetrics;
 use crate::path::{Path, PathId, PathRegistry, PathState};
 use crate::protocol::FluxMessage;
@@ -48,6 +48,11 @@ impl<'a, T: Transport> PathProber<'a, T> {
         self
     }
 
+    /// Get a reference to the registry.
+    pub fn registry(&self) -> &PathRegistry {
+        &self.registry
+    }
+
     /// Probe a single path: connect, ping/pong, calculate RTT, update registry.
     pub async fn probe_path(&self, path: &Path) -> Result<PathMetrics, ProberError> {
         let peer_id = &path.peer_id;
@@ -70,14 +75,12 @@ impl<'a, T: Transport> PathProber<'a, T> {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 warn!("[PROBER] Path {} connection failed: {}", path_id, e);
-                self.registry
-                    .set_path_state(peer_id, path_id, PathState::Unavailable);
+                self.record_probe_failure(peer_id, path_id, path);
                 return Err(ProberError::Transport(e.to_string()));
             }
             Err(_) => {
                 warn!("[PROBER] Path {} connection timed out", path_id);
-                self.registry
-                    .set_path_state(peer_id, path_id, PathState::Unavailable);
+                self.record_probe_failure(peer_id, path_id, path);
                 return Err(ProberError::Timeout);
             }
         };
@@ -126,14 +129,23 @@ impl<'a, T: Transport> PathProber<'a, T> {
             }
             Err(err) => {
                 warn!("[PROBER] Path {} ping/pong failed: {}", path_id, err);
-                self.registry
-                    .set_path_state(peer_id, path_id, PathState::Unavailable);
+                self.record_probe_failure(peer_id, path_id, path);
                 Err(err)
             }
         }
     }
 
-    /// Probe all registered paths for a given peer.
+    /// Record a probe failure: increment failure counter, preserve last RTT,
+    /// mark path Unavailable.
+    fn record_probe_failure(&self, peer_id: &PeerId, path_id: &PathId, path: &Path) {
+        let mut metrics = path.metrics.unwrap_or_default();
+        metrics.record_failure();
+        self.registry.set_path_metrics(peer_id, path_id, metrics);
+        self.registry
+            .set_path_state(peer_id, path_id, PathState::Unavailable);
+    }
+
+    /// Probe all registered paths for a given peer (sequential).
     pub async fn probe_peer_paths(
         &self,
         peer_id: &PeerId,
@@ -149,6 +161,39 @@ impl<'a, T: Transport> PathProber<'a, T> {
             results.push((path.id, res));
         }
         results
+    }
+
+    /// Probe ALL registered paths across ALL peers concurrently.
+    ///
+    /// Uses `futures::future::join_all` to run independent probes
+    /// in parallel within the current async task. Does not spawn
+    /// OS threads or detached tasks.
+    pub async fn probe_all_concurrent(&self) -> Vec<(PathId, Result<PathMetrics, ProberError>)> {
+        // Snapshot all paths from the registry
+        let all_paths: Vec<Path> = self
+            .registry
+            .all_peers()
+            .iter()
+            .filter_map(|peer_id| self.registry.get_paths(peer_id))
+            .flat_map(|set| set.list().to_vec())
+            .collect();
+
+        if all_paths.is_empty() {
+            return Vec::new();
+        }
+
+        // Build a future per path — all futures share &self (Send + Sync)
+        let futures: Vec<_> = all_paths.iter().map(|path| self.probe_path(path)).collect();
+
+        // Run all probes concurrently
+        let results = futures::future::join_all(futures).await;
+
+        // Pair results with path IDs
+        all_paths
+            .iter()
+            .zip(results)
+            .map(|(p, r)| (p.id.clone(), r))
+            .collect()
     }
 }
 
@@ -238,6 +283,72 @@ mod tests {
         let updated_paths = registry_a.get_paths(&peer_b).unwrap();
         let updated_path = updated_paths.get(&path_id).unwrap();
         assert_eq!(updated_path.state, PathState::Unavailable);
-        assert!(updated_path.metrics.is_none());
+        // Metrics should now exist with failure recorded
+        assert!(updated_path.metrics.is_some());
+        assert_eq!(updated_path.metrics.unwrap().consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn test_probe_all_concurrent_multiple_paths() {
+        let peer_a = PeerId::new();
+        let peer_b = PeerId::new();
+
+        let registry = PathRegistry::new();
+
+        // Set up two reachable listeners
+        let addr1: SocketAddr = "127.0.0.1:9201".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:9202".parse().unwrap();
+        let addr3: SocketAddr = "127.0.0.1:9203".parse().unwrap(); // unreachable
+
+        let path1 = Path::new(peer_b.clone(), TransportKind::Tcp, addr1);
+        let path2 = Path::new(peer_b.clone(), TransportKind::Tcp, addr2);
+        let path3 = Path::new(peer_b.clone(), TransportKind::Tcp, addr3);
+        let id1 = path1.id.clone();
+        let id2 = path2.id.clone();
+        let id3 = path3.id.clone();
+
+        registry.register_path(path1);
+        registry.register_path(path2);
+        registry.register_path(path3);
+
+        let transport_b = TcpTransport::default();
+        let p_b = peer_b.clone();
+
+        // Spawn two listeners
+        for addr in [addr1, addr2] {
+            let listener = transport_b.listen(addr).await.unwrap();
+            let p = p_b.clone();
+            tokio::spawn(async move {
+                let mut l = listener;
+                if let Ok((mut conn, _)) = l.accept().await {
+                    let tcp_conn = conn
+                        .as_any_mut()
+                        .downcast_mut::<crate::transport::TcpConnection>()
+                        .unwrap();
+                    if tcp_conn.server_handshake(&p).await.is_ok() {
+                        if let Ok(FluxMessage::Ping { sequence, payload }) =
+                            tcp_conn.recv_message().await
+                        {
+                            let _ = tcp_conn
+                                .send_message(&FluxMessage::pong(sequence, payload))
+                                .await;
+                        }
+                    }
+                }
+            });
+        }
+
+        let transport_a = TcpTransport::default();
+        let prober = PathProber::new(&transport_a, peer_a, registry.clone())
+            .with_timeout(Duration::from_millis(500));
+
+        let results = prober.probe_all_concurrent().await;
+        assert_eq!(results.len(), 3, "Should have probed all 3 paths");
+
+        // Check registry state
+        let paths = registry.get_paths(&peer_b).unwrap();
+        assert_eq!(paths.get(&id1).unwrap().state, PathState::Available);
+        assert_eq!(paths.get(&id2).unwrap().state, PathState::Available);
+        assert_eq!(paths.get(&id3).unwrap().state, PathState::Unavailable);
     }
 }
