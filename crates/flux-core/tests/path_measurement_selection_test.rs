@@ -1,4 +1,4 @@
-use flux_core::identity::PeerId;
+﻿use flux_core::identity::PeerId;
 use flux_core::path::{Path, PathProber, PathRegistry, PathSelector, PathState, TransportKind};
 use flux_core::protocol::FluxMessage;
 use flux_core::session::SessionBuilder;
@@ -110,7 +110,10 @@ async fn test_path_measurement_and_deterministic_auto_selection() {
     assert!(p2_record.metrics.is_some());
 
     assert_eq!(p3_record.state, PathState::Unavailable);
-    assert!(p3_record.metrics.is_none());
+    assert!(p3_record.metrics.is_some());
+    let p3_metrics = p3_record.metrics.unwrap();
+    assert_eq!(p3_metrics.rtt_ms, None);
+    assert_eq!(p3_metrics.consecutive_failures, 1);
 
     let rtt1 = p1_record.metrics.unwrap().rtt_ms.unwrap();
     let rtt2 = p2_record.metrics.unwrap().rtt_ms.unwrap();

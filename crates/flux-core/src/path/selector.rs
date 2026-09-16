@@ -1,4 +1,4 @@
-use crate::identity::PeerId;
+﻿use crate::identity::PeerId;
 use crate::path::{Path, PathRegistry, PathSet, PathState};
 
 /// Deterministic path selector.
@@ -7,6 +7,7 @@ use crate::path::{Path, PathRegistry, PathSet, PathState};
 /// 1. Only considering `PathState::Available` paths with measured RTT.
 /// 2. Selecting the lowest measured round-trip time (RTT).
 /// 3. Breaking ties deterministically using stable `PathId` ordering.
+#[derive(Debug, Clone)]
 pub struct PathSelector {
     registry: PathRegistry,
 }
