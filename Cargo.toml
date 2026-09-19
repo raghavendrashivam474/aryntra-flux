@@ -1,6 +1,7 @@
 [workspace]
 members = [
-    "crates/flux-core",
+    "crates/flux-gateway",
+    "crates/flux-core", "crates/flux-gateway",
     "crates/flux-node",
 ]
 resolver = "2"
