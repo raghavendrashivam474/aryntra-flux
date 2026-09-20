@@ -1,4 +1,4 @@
-﻿use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use flux_core::{
     identity::PeerId,
     node::FluxNode,
@@ -113,6 +113,9 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("Identity: {}", node.identity);
             println!("Port: {}\n", port);
+
+            // S7.1: Activate mDNS/UDP discovery for Node B
+            node.start().await?;
 
             let transport = TcpTransport::new();
             let listen_addr: SocketAddr = format!("0.0.0.0:{}", port).parse()?;
@@ -231,6 +234,9 @@ async fn main() -> anyhow::Result<()> {
             println!("Target: {}", addr);
             println!("Message: {}\n", message);
 
+            // S7.1: Activate mDNS/UDP discovery for Node B
+            node.start().await?;
+
             let transport = TcpTransport::new();
             let target_addr: SocketAddr = addr.parse()?;
             let target_peer_id = PeerId::new();
@@ -300,6 +306,9 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             };
+
+            // S7.1: Activate mDNS/UDP discovery for Node B
+            node.start().await?;
 
             let transport = TcpTransport::new();
             let target_addr: SocketAddr = addr.parse()?;
