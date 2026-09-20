@@ -28,53 +28,75 @@ async fn connect_peer(
     State(state): State<GatewayState>,
     Json(payload): Json<ConnectRequest>,
 ) -> GatewayResult<Json<ConnectResponse>> {
-    // 1. Parse and validate Target Peer ID
     let target_uuid = uuid::Uuid::parse_str(&payload.peer_id)
         .map_err(|e| GatewayError::InvalidRequest(format!("Invalid UUID: {}", e)))?;
 
-    // We recreate the exact PeerId wrapping this Uuid to query registries
     let target_peer_id = serde_json::from_str::<PeerId>(&format!("\"{}\"", target_uuid))
         .map_err(|e| GatewayError::Internal(format!("Failed to reconstruct PeerId: {}", e)))?;
 
-    // 2. Validate peer is present in our PeerRegistry
     let peer_list = state.node.registry.list();
     let registry_peer = peer_list
         .iter()
         .find(|p| p.id == target_peer_id)
         .ok_or_else(|| GatewayError::PeerNotFound(payload.peer_id.clone()))?;
 
-    // 3. Optimal Path Selection via PathSelector
     let selector = PathSelector::new(state.node.path_registry.clone());
-    let (target_addr, source) = match selector.select_path(&target_peer_id) {
-        Some(optimal_path) => {
+
+    let (target_addr, source) = if let Some(optimal_path) = selector.select_path(&target_peer_id) {
+        tracing::info!(
+            "Selected optimal path for {}: {}",
+            target_peer_id,
+            optimal_path.remote_addr
+        );
+        (optimal_path.remote_addr, "optimal_path_selector")
+    } else if let Some(path_set) = state.node.path_registry.get_paths(&target_peer_id) {
+        if let Some(path) = path_set.list().iter().find(|path| {
+            matches!(
+                path.state,
+                flux_core::path::PathState::Discovered
+                    | flux_core::path::PathState::Candidate
+                    | flux_core::path::PathState::Connecting
+            )
+        }) {
             tracing::info!(
-                "Selected optimal path for {}: {}",
+                "Using discovered path for {}: {}",
                 target_peer_id,
-                optimal_path.remote_addr
+                path.remote_addr
             );
-            (optimal_path.remote_addr, "optimal_path_selector")
-        }
-        None => {
-            // Fall back to primary registry address
+            (path.remote_addr, "discovered_path")
+        } else {
             let parsed_addr: SocketAddr = registry_peer.address.parse().map_err(|e| {
                 GatewayError::InvalidRequest(format!(
                     "Invalid peer registry address '{}': {}",
                     registry_peer.address, e
                 ))
             })?;
-            tracing::info!("No metrics-optimal path available yet; falling back to primary registry address: {}", parsed_addr);
+            tracing::info!(
+                "No usable path available; falling back to peer registry address: {}",
+                parsed_addr
+            );
             (parsed_addr, "peer_registry_fallback")
         }
+    } else {
+        let parsed_addr: SocketAddr = registry_peer.address.parse().map_err(|e| {
+            GatewayError::InvalidRequest(format!(
+                "Invalid peer registry address '{}': {}",
+                registry_peer.address, e
+            ))
+        })?;
+        tracing::info!(
+            "No path registry entry; falling back to peer registry address: {}",
+            parsed_addr
+        );
+        (parsed_addr, "peer_registry_fallback")
     };
 
-    // 4. Connect and Establish Session
     let session_builder = SessionBuilder::new(&*state.transport, state.node.identity.clone());
     let session = session_builder
         .connect(&target_peer_id, target_addr)
         .await
         .map_err(|e| GatewayError::Internal(format!("Failed to connect: {}", e)))?;
 
-    // 5. Store Session in Active Session Pool
     let mut sessions_guard = state.sessions.lock().await;
     sessions_guard.insert(payload.peer_id.clone(), session);
 

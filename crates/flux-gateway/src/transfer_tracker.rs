@@ -75,6 +75,19 @@ impl GatewayTransferTracker {
         guard.get(transfer_id).map(|t| t.info.clone())
     }
 
+    pub async fn active_count(&self) -> usize {
+        let guard = self.transfers.read().await;
+        guard
+            .values()
+            .filter(|transfer| {
+                matches!(
+                    transfer.info.status,
+                    TransferStatus::Created | TransferStatus::Running
+                )
+            })
+            .count()
+    }
+
     pub async fn update_progress(&self, transfer_id: &str, bytes: u64, files: usize) {
         let mut guard = self.transfers.write().await;
         if let Some(transfer) = guard.get_mut(transfer_id) {

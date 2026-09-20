@@ -48,7 +48,7 @@ async fn test_get_identity() {
 
 #[tokio::test]
 async fn test_get_status() {
-    let (url, _, _) = spawn_test_gateway().await;
+    let (url, node, _) = spawn_test_gateway().await;
     let client = reqwest::Client::new();
 
     let res = client
@@ -59,9 +59,12 @@ async fn test_get_status() {
     assert_eq!(res.status(), StatusCode::OK);
 
     let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["status"], "running");
-    assert!(body["peers_known"].is_number());
-    assert!(body["paths_tracked"].is_number());
+
+    assert_eq!(body["state"], "running");
+    assert_eq!(body["peer_id"], node.identity.to_string());
+    assert!(body["discovered_peer_count"].is_number());
+    assert!(body["active_path_count"].is_number());
+    assert!(body["active_transfer_count"].is_number());
 }
 
 #[tokio::test]
