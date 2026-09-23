@@ -861,3 +861,201 @@ async fn test_e2e_cancellation_preserves_partial_state_and_resumes() {
     let received_data = fs::read(&final_path).await.unwrap();
     assert_eq!(compute_hash(&received_data), expected_hash);
 }
+
+#[tokio::test]
+async fn test_e2e_tcp_multi_file_progress_observability() {
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    let file1_path = sender_dir.path().join("f1.bin");
+    let payload1 = create_test_file(&file1_path, 100 * 1024).await;
+    let hash1 = compute_hash(&payload1);
+
+    let file2_path = sender_dir.path().join("f2.bin");
+    let payload2 = create_test_file(&file2_path, 200 * 1024).await;
+    let hash2 = compute_hash(&payload2);
+
+    let file3_path = sender_dir.path().join("f3.bin");
+    let payload3 = create_test_file(&file3_path, 300 * 1024).await;
+    let hash3 = compute_hash(&payload3);
+
+    let total_expected_bytes = (payload1.len() + payload2.len() + payload3.len()) as u64;
+
+    let plan = TransferPlan::from_paths(&[file1_path, file2_path, file3_path]).unwrap();
+    assert_eq!(plan.len(), 3);
+
+    let sender_progress = flux_core::transfer::TransferProgress::new();
+    let receiver_progress = flux_core::transfer::TransferProgress::new();
+    let cancel = flux_core::transfer::TransferCancellation::new();
+
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    let r_dir = receiver_dir.path().to_path_buf();
+    let r_id = remote_peer_id.clone();
+    let r_cancel = cancel.clone();
+    let r_prog = receiver_progress.clone();
+
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&r_id).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, r_id);
+        TransferManager::receive_collection_with_cancel_and_progress(
+            &mut session,
+            &r_dir,
+            &r_cancel,
+            &r_prog,
+        )
+        .await
+        .unwrap();
+        session.close().await.unwrap();
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender = session_builder
+        .connect(&remote_peer_id, local_addr)
+        .await
+        .unwrap();
+
+    TransferManager::send_collection_with_cancel_and_progress(
+        &mut session_sender,
+        &plan,
+        &cancel,
+        &sender_progress,
+    )
+    .await
+    .unwrap();
+
+    session_sender.close().await.unwrap();
+    receiver_handle.await.unwrap();
+
+    // Verify progress observability
+    assert_eq!(sender_progress.files_completed(), 3);
+    assert_eq!(sender_progress.bytes_transferred(), total_expected_bytes);
+
+    assert_eq!(receiver_progress.files_completed(), 3);
+    assert_eq!(receiver_progress.bytes_transferred(), total_expected_bytes);
+
+    // Verify byte integrity on disk
+    let data1 = fs::read(receiver_dir.path().join("f1.bin")).await.unwrap();
+    assert_eq!(compute_hash(&data1), hash1);
+
+    let data2 = fs::read(receiver_dir.path().join("f2.bin")).await.unwrap();
+    assert_eq!(compute_hash(&data2), hash2);
+
+    let data3 = fs::read(receiver_dir.path().join("f3.bin")).await.unwrap();
+    assert_eq!(compute_hash(&data3), hash3);
+}
+
+#[tokio::test]
+async fn test_e2e_tcp_resume_progress_observability() {
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    // 200 KiB file
+    let file_path = sender_dir.path().join("resume_observable.bin");
+    let payload = create_test_file(&file_path, 200 * 1024).await;
+    let expected_hash = compute_hash(&payload);
+
+    let plan = TransferPlan::from_paths(std::slice::from_ref(&file_path)).unwrap();
+
+    // Pre-create partial state with 1 chunk (64 KiB)
+    let chunks_received = 1u32;
+    let bytes_received = (chunks_received as u64) * (DEFAULT_CHUNK_SIZE as u64);
+    let part_data = &payload[..bytes_received as usize];
+
+    let part_path = receiver_dir.path().join("resume_observable.bin.part");
+    let meta_path = receiver_dir.path().join("resume_observable.bin.part.meta");
+
+    fs::write(&part_path, part_data).await.unwrap();
+
+    let partial_state = PartialTransferState {
+        file_name: "resume_observable.bin".to_string(),
+        file_size: payload.len() as u64,
+        chunk_size: DEFAULT_CHUNK_SIZE,
+        total_chunks: (payload.len() as u64).div_ceil(DEFAULT_CHUNK_SIZE as u64) as u32,
+        sha256: expected_hash,
+        chunks_received,
+        bytes_received,
+        relative_path: Some("resume_observable.bin".to_string()),
+    };
+    let encoded_meta = bincode::serialize(&partial_state).unwrap();
+    fs::write(&meta_path, &encoded_meta).await.unwrap();
+
+    let sender_progress = flux_core::transfer::TransferProgress::new();
+    let receiver_progress = flux_core::transfer::TransferProgress::new();
+    let cancel = flux_core::transfer::TransferCancellation::new();
+
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    let r_dir = receiver_dir.path().to_path_buf();
+    let r_id = remote_peer_id.clone();
+    let r_cancel = cancel.clone();
+    let r_prog = receiver_progress.clone();
+
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&r_id).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, r_id);
+        TransferManager::receive_collection_with_cancel_and_progress(
+            &mut session,
+            &r_dir,
+            &r_cancel,
+            &r_prog,
+        )
+        .await
+        .unwrap();
+        session.close().await.unwrap();
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender = session_builder
+        .connect(&remote_peer_id, local_addr)
+        .await
+        .unwrap();
+
+    TransferManager::send_collection_with_cancel_and_progress(
+        &mut session_sender,
+        &plan,
+        &cancel,
+        &sender_progress,
+    )
+    .await
+    .unwrap();
+
+    session_sender.close().await.unwrap();
+    receiver_handle.await.unwrap();
+
+    // Verify progress across resume accounts for total logical file size
+    assert_eq!(sender_progress.files_completed(), 1);
+    assert_eq!(sender_progress.bytes_transferred(), payload.len() as u64);
+
+    assert_eq!(receiver_progress.files_completed(), 1);
+    assert_eq!(receiver_progress.bytes_transferred(), payload.len() as u64);
+
+    // Verify final file
+    let final_path = receiver_dir.path().join("resume_observable.bin");
+    let received_data = fs::read(&final_path).await.unwrap();
+    assert_eq!(compute_hash(&received_data), expected_hash);
+}
