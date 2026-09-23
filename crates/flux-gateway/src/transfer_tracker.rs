@@ -1,4 +1,4 @@
-use flux_core::transfer::{TransferCancellation, TransferProgress};
+﻿use flux_core::transfer::{TransferCancellation, TransferProgress};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -179,5 +179,27 @@ impl GatewayTransferTracker {
             }
         }
         false
+    }
+
+    /// Continue an existing logical transfer with a new execution carrier task.
+    ///
+    /// Preserves the existing `TransferCancellation` token and `TransferProgress`
+    /// tracker so that the transfer identity and live byte counters remain
+    /// continuous across session/path replacement.
+    pub async fn attach_continuation(
+        &self,
+        transfer_id: &str,
+        new_task_handle: Option<JoinHandle<()>>,
+    ) -> Option<(TransferCancellation, TransferProgress)> {
+        let mut guard = self.transfers.write().await;
+        if let Some(transfer) = guard.get_mut(transfer_id) {
+            // Re-establish Running state and clear any temporary error message
+            transfer.info.status = TransferStatus::Running;
+            transfer.info.error_message = None;
+            transfer.task_handle = new_task_handle;
+            Some((transfer.cancel_token.clone(), transfer.progress.clone()))
+        } else {
+            None
+        }
     }
 }
