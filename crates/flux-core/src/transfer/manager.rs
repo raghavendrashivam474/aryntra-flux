@@ -234,7 +234,10 @@ impl TransferManager {
 
         for (idx, item) in plan.items.iter().enumerate() {
             if cancel.is_cancelled() {
-                println!("\nCollection transfer cancelled before sending item {}", idx + 1);
+                println!(
+                    "\nCollection transfer cancelled before sending item {}",
+                    idx + 1
+                );
                 return Err(TransferError::Cancelled);
             }
 
@@ -242,7 +245,8 @@ impl TransferManager {
             let relative_str = item.relative_path.to_string_lossy().to_string();
 
             if let Err(e) =
-                Self::send_file_internal(session, &item.source_path, Some(relative_str), cancel).await
+                Self::send_file_internal(session, &item.source_path, Some(relative_str), cancel)
+                    .await
             {
                 eprintln!("\nError sending item {}: {}", item.source_path.display(), e);
                 return Err(e);
@@ -338,7 +342,9 @@ impl TransferManager {
                 }
                 FluxMessage::TransferCancel { transfer_id } => {
                     if transfer_id == metadata.transfer_id {
-                        println!("\n    Received TransferCancel from sender. Preserving partial state.");
+                        println!(
+                            "\n    Received TransferCancel from sender. Preserving partial state."
+                        );
                         return Err(TransferError::Cancelled);
                     }
                     return Err(TransferError::UnexpectedMessage(
@@ -356,7 +362,9 @@ impl TransferManager {
         println!();
 
         if cancel.is_cancelled() {
-            println!("    Receiver cancelled locally before finalization. Preserving partial state.");
+            println!(
+                "    Receiver cancelled locally before finalization. Preserving partial state."
+            );
             let _ = session
                 .send_message(&FluxMessage::TransferCancel {
                     transfer_id: metadata.transfer_id,
@@ -452,7 +460,8 @@ impl TransferManager {
 
             match msg {
                 FluxMessage::TransferRequest { metadata } => {
-                    Self::receive_transfer_with_cancel(session, metadata, output_dir, cancel).await?;
+                    Self::receive_transfer_with_cancel(session, metadata, output_dir, cancel)
+                        .await?;
                 }
                 FluxMessage::Goodbye => {
                     println!("Goodbye received. Collection transfer completed successfully.");

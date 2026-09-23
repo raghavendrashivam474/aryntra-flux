@@ -1,4 +1,4 @@
-﻿use crate::identity::PeerId;
+use crate::identity::PeerId;
 use crate::transfer::{TransferId, TransferMetadata};
 use serde::{Deserialize, Serialize};
 

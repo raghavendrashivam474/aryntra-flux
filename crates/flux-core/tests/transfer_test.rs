@@ -755,7 +755,8 @@ async fn test_e2e_cancellation_pre_transfer() {
     let cancel = flux_core::transfer::TransferCancellation::new();
     cancel.cancel(); // Cancel before initiating
 
-    let res = TransferManager::send_collection_with_cancel(&mut session_sender, &plan, &cancel).await;
+    let res =
+        TransferManager::send_collection_with_cancel(&mut session_sender, &plan, &cancel).await;
     assert!(matches!(res, Err(TransferError::Cancelled)));
 
     let _ = session_sender.close().await;
@@ -813,7 +814,8 @@ async fn test_e2e_cancellation_preserves_partial_state_and_resumes() {
         cancel_token_clone.cancel();
     });
 
-    let _ = TransferManager::send_collection_with_cancel(&mut session_sender, &plan, &cancel_token).await;
+    let _ = TransferManager::send_collection_with_cancel(&mut session_sender, &plan, &cancel_token)
+        .await;
     let _ = session_sender.close().await;
     let _ = receiver_handle.await;
 
@@ -833,7 +835,9 @@ async fn test_e2e_cancellation_preserves_partial_state_and_resumes() {
             tcp_conn.server_handshake(&r_id2).await.unwrap();
         }
         let mut session = Session::from_connection(conn, r_id2);
-        TransferManager::receive_collection(&mut session, &r_dir2).await.unwrap();
+        TransferManager::receive_collection(&mut session, &r_dir2)
+            .await
+            .unwrap();
         session.close().await.unwrap();
     });
 

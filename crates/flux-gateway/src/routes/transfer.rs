@@ -116,7 +116,8 @@ async fn start_transfer(
         guard.session = Some(session);
 
         let session_ref = guard.session.as_mut().unwrap();
-        match TransferManager::send_collection_with_cancel(session_ref, &plan, &cancel_clone).await {
+        match TransferManager::send_collection_with_cancel(session_ref, &plan, &cancel_clone).await
+        {
             Ok(()) => {
                 tracing::info!("Transfer {} completed successfully.", transfer_id_clone);
                 tracker_clone.mark_completed(&transfer_id_clone).await;
