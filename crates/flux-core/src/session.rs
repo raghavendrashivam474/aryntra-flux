@@ -38,6 +38,11 @@ impl Session {
         self.state
     }
 
+    /// Check if session is currently established and active
+    pub fn is_established(&self) -> bool {
+        self.state == SessionState::Established
+    }
+
     /// Get remote peer ID
     pub fn peer_id(&self) -> Option<&PeerId> {
         self.connection.peer_id()
@@ -74,7 +79,23 @@ impl Session {
         Ok(msg)
     }
 
-    /// Close session gracefully
+    /// Controlled cooperative session shutdown without consuming ownership.
+    ///
+    /// Sends a Goodbye message if established and marks state as Closed.
+    /// Idempotent if already closing or closed.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        if self.state == SessionState::Closed || self.state == SessionState::Closing {
+            return Ok(());
+        }
+
+        self.state = SessionState::Closing;
+        let _ = self.connection.send_message(&FluxMessage::Goodbye).await;
+        self.state = SessionState::Closed;
+        info!("[SESSION] Session shut down cooperatively");
+        Ok(())
+    }
+
+    /// Close session gracefully, consuming the session and releasing underlying resources.
     pub async fn close(mut self) -> Result<()> {
         self.state = SessionState::Closing;
         self.connection.close().await?;
@@ -169,6 +190,7 @@ mod tests {
 
         let mut session = Session::from_connection(Box::new(dummy), local_id);
         assert_eq!(session.state(), SessionState::Established);
+        assert!(session.is_established());
         assert_eq!(session.peer_id(), Some(&remote_id));
         assert_eq!(session.remote_addr(), addr);
 
@@ -179,5 +201,33 @@ mod tests {
         assert!(recv_res.is_ok());
 
         assert!(session.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_session_shutdown() {
+        let local_id = PeerId::new();
+        let remote_id = PeerId::new();
+        let addr: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+
+        let dummy = DummyConnection {
+            peer_id: remote_id.clone(),
+            addr,
+        };
+
+        let mut session = Session::from_connection(Box::new(dummy), local_id);
+        assert!(session.is_established());
+
+        // Cooperative shutdown without consuming
+        assert!(session.shutdown().await.is_ok());
+        assert_eq!(session.state(), SessionState::Closed);
+        assert!(!session.is_established());
+
+        // Repeated shutdown is idempotent
+        assert!(session.shutdown().await.is_ok());
+
+        // Sending or receiving on shutdown session returns error
+        let ping = FluxMessage::ping(1, "test".to_string());
+        assert!(session.send_message(&ping).await.is_err());
+        assert!(session.recv_message().await.is_err());
     }
 }
