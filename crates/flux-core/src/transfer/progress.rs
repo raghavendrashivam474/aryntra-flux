@@ -37,6 +37,12 @@ impl TransferProgress {
         self.files_completed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Set the completed files count directly.
+    #[inline]
+    pub fn set_files(&self, files: usize) {
+        self.files_completed.store(files, Ordering::Relaxed);
+    }
+
     /// Return the current snapshot of total bytes transferred.
     #[inline]
     pub fn bytes_transferred(&self) -> u64 {
