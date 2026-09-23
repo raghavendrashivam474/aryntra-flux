@@ -1,3 +1,4 @@
+﻿use flux_core::transfer::TransferProgress;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::sync::Arc;
@@ -166,6 +167,7 @@ async fn test_transfer_lifecycle_tracker() {
             2048,
             2,
             TransferCancellation::new(),
+            TransferProgress::new(),
             None,
         )
         .await;
@@ -220,6 +222,7 @@ async fn test_gateway_transfer_cancel_lifecycle() {
             4096,
             1,
             cancel_token.clone(),
+            TransferProgress::new(),
             None,
         )
         .await;
@@ -254,6 +257,7 @@ async fn test_gateway_transfer_cancel_lifecycle() {
             1024,
             1,
             TransferCancellation::new(),
+            TransferProgress::new(),
             None,
         )
         .await;
@@ -268,3 +272,81 @@ async fn test_gateway_transfer_cancel_lifecycle() {
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["cancelled"], false);
 }
+
+#[tokio::test]
+async fn test_gateway_transfer_live_progress_observability() {
+    let (url, _, state) = spawn_test_gateway().await;
+    let client = reqwest::Client::new();
+
+    let transfer_id = "progress-observable-id-1".to_string();
+    let peer_id = "observable-peer".to_string();
+    let cancel_token = TransferCancellation::new();
+    let progress = TransferProgress::new();
+
+    state
+        .tracker
+        .register(
+            transfer_id.clone(),
+            peer_id.clone(),
+            10000000,
+            3,
+            cancel_token,
+            progress.clone(),
+            None,
+        )
+        .await;
+
+    // 1. Initial snapshot: 0 bytes, 0 files
+    let res = client
+        .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["status"], "RUNNING");
+    assert_eq!(body["bytes_transferred"], 0);
+    assert_eq!(body["total_bytes"], 10000000);
+    assert_eq!(body["files_transferred"], 0);
+    assert_eq!(body["total_files"], 3);
+
+    // 2. Simulate chunks arriving dynamically
+    progress.add_bytes(2500000);
+    let res = client
+        .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["bytes_transferred"], 2500000);
+    assert_eq!(body["files_transferred"], 0);
+
+    // 3. Complete first file
+    progress.add_bytes(1000000);
+    progress.add_file();
+    let res = client
+        .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["bytes_transferred"], 3500000);
+    assert_eq!(body["files_transferred"], 1);
+
+    // 4. Simulate failure and ensure last known progress is preserved
+    state
+        .tracker
+        .mark_failed(&transfer_id, "Simulated network timeout".to_string())
+        .await;
+    let res = client
+        .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["status"], "FAILED");
+    assert_eq!(body["bytes_transferred"], 3500000);
+    assert_eq!(body["files_transferred"], 1);
+    assert_eq!(body["error_message"], "Simulated network timeout");
+}
+
