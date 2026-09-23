@@ -1,6 +1,6 @@
 [package]
 name = "flux-gateway"
-version = "0.1.0"
+version = "0.3.4"
 edition = "2021"
 authors = ["Aryntra Project"]
 description = "HTTP Gateway adapter for Aryntra Flux"
