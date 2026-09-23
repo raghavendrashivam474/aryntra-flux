@@ -1059,3 +1059,383 @@ async fn test_e2e_tcp_resume_progress_observability() {
     let received_data = fs::read(&final_path).await.unwrap();
     assert_eq!(compute_hash(&received_data), expected_hash);
 }
+
+// --- S3.5: Path-Aware Transfer Continuity E2E Tests ---
+
+#[tokio::test]
+async fn test_e2e_transfer_continues_on_alternate_path() {
+    use flux_core::transfer::{TransferCancellation, TransferProgress};
+
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    // 250 KiB file (~4 chunks: 3 full 64 KiB chunks + 1 partial)
+    let file_path = sender_dir.path().join("path_continuity.bin");
+    let payload_size = 250 * 1024;
+    let original_payload = create_test_file(&file_path, payload_size).await;
+    let expected_hash = compute_hash(&original_payload);
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    // --- Phase 1: Establish Path A (Listener A / Session 1) and partially transfer ---
+    let transport_receiver_a = TcpTransport::new();
+    let mut listener_a = transport_receiver_a
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_a = listener_a.local_addr();
+
+    let remote_id_spawn_a = remote_peer_id.clone();
+    let receiver_dir_spawn_a = receiver_dir.path().to_path_buf();
+    let sender_progress = TransferProgress::new();
+    let sender_cancel = TransferCancellation::new();
+
+    // Receiver on Path A: receives only 2 chunks, then forcefully breaks session
+    let receiver_handle_a = tokio::spawn(async move {
+        let (mut conn, _) = listener_a.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_a).await.unwrap();
+        }
+
+        let mut session = Session::from_connection(conn, remote_id_spawn_a);
+        let first_msg = session.recv_message().await.unwrap();
+
+        if let FluxMessage::TransferRequest { metadata } = first_msg {
+            let mut receiver = FileReceiver::new(metadata.clone(), &receiver_dir_spawn_a)
+                .await
+                .unwrap();
+            session
+                .send_message(&FluxMessage::TransferAccept {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await
+                .unwrap();
+
+            // Receive exactly 2 chunks
+            for _ in 0..2 {
+                if let FluxMessage::TransferChunk { index, data, .. } =
+                    session.recv_message().await.unwrap()
+                {
+                    receiver.write_chunk(index, &data).await.unwrap();
+                }
+            }
+            // Simulating sudden path failure: drop session abruptly without finalize
+            drop(session);
+        }
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender_a = session_builder
+        .connect(&remote_peer_id, addr_path_a)
+        .await
+        .unwrap();
+
+    // Sender sends file on Path A; it will hit a connection error when receiver drops
+    let _ = TransferManager::send_file_with_cancel_and_progress(
+        &mut session_sender_a,
+        &file_path,
+        &sender_cancel,
+        &sender_progress,
+    )
+    .await;
+
+    let _ = receiver_handle_a.await;
+
+    // Verify partial state exists on disk (.part and .part.meta)
+    let part_path = receiver_dir.path().join("path_continuity.bin.part");
+    let meta_path = receiver_dir.path().join("path_continuity.bin.part.meta");
+    assert!(
+        part_path.exists(),
+        "Checkpoint .part must exist on Path A failure"
+    );
+    assert!(
+        meta_path.exists(),
+        "Checkpoint .part.meta must exist on Path A failure"
+    );
+
+    // Bytes transferred on Path A should be at least the 2 chunks
+    assert!(sender_progress.bytes_transferred() >= (2 * DEFAULT_CHUNK_SIZE as u64));
+
+    // --- Phase 2: Establish Path B (Listener B / Session 2) and resume the same transfer ---
+    let transport_receiver_b = TcpTransport::new();
+    let mut listener_b = transport_receiver_b
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_b = listener_b.local_addr();
+
+    let remote_id_spawn_b = remote_peer_id.clone();
+    let receiver_dir_spawn_b = receiver_dir.path().to_path_buf();
+    let receiver_progress_b = TransferProgress::new();
+
+    let receiver_handle_b = tokio::spawn(async move {
+        let (mut conn, _) = listener_b.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_b).await.unwrap();
+        }
+
+        let mut session = Session::from_connection(conn, remote_id_spawn_b);
+        let first_msg = session.recv_message().await.unwrap();
+
+        if let FluxMessage::TransferRequest { metadata } = first_msg {
+            let cancel = TransferCancellation::new();
+            TransferManager::receive_transfer_with_cancel_and_progress(
+                &mut session,
+                metadata,
+                &receiver_dir_spawn_b,
+                &cancel,
+                &receiver_progress_b,
+            )
+            .await
+            .unwrap();
+        }
+
+        session.close().await.unwrap();
+        receiver_progress_b
+    });
+
+    let mut session_sender_b = session_builder
+        .connect(&remote_peer_id, addr_path_b)
+        .await
+        .unwrap();
+
+    // Continue the exact same logical transfer over Path B using the same progress tracker
+    // Reset progress tracking to match the resume starting point (sender will add resumed bytes)
+    let resumed_sender_progress = TransferProgress::new();
+    TransferManager::send_file_with_cancel_and_progress(
+        &mut session_sender_b,
+        &file_path,
+        &sender_cancel,
+        &resumed_sender_progress,
+    )
+    .await
+    .unwrap();
+
+    session_sender_b.close().await.unwrap();
+    let final_receiver_progress = receiver_handle_b.await.unwrap();
+
+    // Verify logical transfer completion & integrity
+    let final_file = receiver_dir.path().join("path_continuity.bin");
+    assert!(
+        final_file.exists(),
+        "Final file must exist after Path B continuation"
+    );
+    assert!(
+        !part_path.exists(),
+        "Temporary .part file must be cleaned up"
+    );
+    assert!(
+        !meta_path.exists(),
+        "Temporary .part.meta file must be cleaned up"
+    );
+
+    let received_data = fs::read(&final_file).await.unwrap();
+    assert_eq!(received_data, original_payload);
+    assert_eq!(compute_hash(&received_data), expected_hash);
+
+    // Verify progress metrics
+    assert_eq!(
+        resumed_sender_progress.bytes_transferred(),
+        payload_size as u64
+    );
+    assert_eq!(
+        final_receiver_progress.bytes_transferred(),
+        payload_size as u64
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_multi_file_transfer_continues_on_alternate_path() {
+    use flux_core::transfer::continuity::TransferContinuation;
+    use flux_core::transfer::{TransferCancellation, TransferProgress};
+
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    // 3 files: 50 KB, 200 KB (multichunk), 100 KB
+    let f1_path = sender_dir.path().join("doc1.bin");
+    let p1 = create_test_file(&f1_path, 50 * 1024).await;
+    let h1 = compute_hash(&p1);
+
+    let f2_path = sender_dir.path().join("doc2.bin");
+    let p2 = create_test_file(&f2_path, 200 * 1024).await;
+    let h2 = compute_hash(&p2);
+
+    let f3_path = sender_dir.path().join("doc3.bin");
+    let p3 = create_test_file(&f3_path, 100 * 1024).await;
+    let h3 = compute_hash(&p3);
+
+    let total_bytes = (p1.len() + p2.len() + p3.len()) as u64;
+
+    let plan =
+        TransferPlan::from_paths(&[f1_path.clone(), f2_path.clone(), f3_path.clone()]).unwrap();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    // --- Phase 1: Path A completes f1, partially writes f2, then fails ---
+    let transport_receiver_a = TcpTransport::new();
+    let mut listener_a = transport_receiver_a
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_a = listener_a.local_addr();
+
+    let remote_id_spawn_a = remote_peer_id.clone();
+    let receiver_dir_spawn_a = receiver_dir.path().to_path_buf();
+    let shared_progress = TransferProgress::new();
+    let shared_cancel = TransferCancellation::new();
+
+    let receiver_handle_a = tokio::spawn(async move {
+        let (mut conn, _) = listener_a.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_a).await.unwrap();
+        }
+
+        let mut session = Session::from_connection(conn, remote_id_spawn_a);
+
+        // Receive doc1.bin fully
+        let msg1 = session.recv_message().await.unwrap();
+        if let FluxMessage::TransferRequest { metadata } = msg1 {
+            let cancel = TransferCancellation::new();
+            let prog = TransferProgress::new();
+            TransferManager::receive_transfer_with_cancel_and_progress(
+                &mut session,
+                metadata,
+                &receiver_dir_spawn_a,
+                &cancel,
+                &prog,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Receive doc2.bin partially (2 chunks)
+        let msg2 = session.recv_message().await.unwrap();
+        if let FluxMessage::TransferRequest { metadata } = msg2 {
+            let mut receiver = FileReceiver::new(metadata.clone(), &receiver_dir_spawn_a)
+                .await
+                .unwrap();
+            session
+                .send_message(&FluxMessage::TransferAccept {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await
+                .unwrap();
+
+            for _ in 0..2 {
+                if let FluxMessage::TransferChunk { index, data, .. } =
+                    session.recv_message().await.unwrap()
+                {
+                    receiver.write_chunk(index, &data).await.unwrap();
+                }
+            }
+            // Sudden Path A connection drop
+            drop(session);
+        }
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender_a = session_builder
+        .connect(&remote_peer_id, addr_path_a)
+        .await
+        .unwrap();
+
+    let _ = TransferManager::send_collection_with_cancel_and_progress(
+        &mut session_sender_a,
+        &plan,
+        &shared_cancel,
+        &shared_progress,
+    )
+    .await;
+
+    let _ = receiver_handle_a.await;
+
+    // Verify doc1 completed, doc2 is partial (.part exists), doc3 unstarted
+    assert!(receiver_dir.path().join("doc1.bin").exists());
+    assert!(receiver_dir.path().join("doc2.bin.part").exists());
+    assert!(!receiver_dir.path().join("doc3.bin").exists());
+
+    // 1 file was completed on Path A
+    assert_eq!(shared_progress.files_completed(), 1);
+
+    // --- Phase 2: Create TransferContinuation and execute over Path B ---
+    let continuation = TransferContinuation::from_interrupted(
+        plan.clone(),
+        shared_progress.clone(),
+        shared_cancel.clone(),
+        1, // 1 file completed
+    );
+
+    assert_eq!(continuation.remaining_files(), 2);
+    assert!(!continuation.is_complete());
+
+    let transport_receiver_b = TcpTransport::new();
+    let mut listener_b = transport_receiver_b
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_b = listener_b.local_addr();
+
+    let remote_id_spawn_b = remote_peer_id.clone();
+    let receiver_dir_spawn_b = receiver_dir.path().to_path_buf();
+    let receiver_progress_b = TransferProgress::new();
+
+    let receiver_handle_b = tokio::spawn(async move {
+        let (mut conn, _) = listener_b.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_b).await.unwrap();
+        }
+
+        let mut session = Session::from_connection(conn, remote_id_spawn_b);
+        let cancel = TransferCancellation::new();
+        TransferManager::receive_collection_with_cancel_and_progress(
+            &mut session,
+            &receiver_dir_spawn_b,
+            &cancel,
+            &receiver_progress_b,
+        )
+        .await
+        .unwrap();
+
+        session.close().await.unwrap();
+        receiver_progress_b
+    });
+
+    let mut session_sender_b = session_builder
+        .connect(&remote_peer_id, addr_path_b)
+        .await
+        .unwrap();
+
+    // Continue over Path B
+    TransferManager::continue_collection(&mut session_sender_b, &continuation)
+        .await
+        .unwrap();
+
+    session_sender_b.close().await.unwrap();
+    let _ = receiver_handle_b.await.unwrap();
+
+    // Verify all 3 files exist and are intact
+    let rf1 = receiver_dir.path().join("doc1.bin");
+    let rf2 = receiver_dir.path().join("doc2.bin");
+    let rf3 = receiver_dir.path().join("doc3.bin");
+
+    assert!(rf1.exists());
+    assert!(rf2.exists());
+    assert!(rf3.exists());
+
+    assert_eq!(compute_hash(&fs::read(&rf1).await.unwrap()), h1);
+    assert_eq!(compute_hash(&fs::read(&rf2).await.unwrap()), h2);
+    assert_eq!(compute_hash(&fs::read(&rf3).await.unwrap()), h3);
+
+    // Verify checkpoints are cleaned up
+    assert!(!receiver_dir.path().join("doc2.bin.part").exists());
+    assert!(!receiver_dir.path().join("doc2.bin.part.meta").exists());
+
+    // Logical progress must reflect all 3 files completed and total bytes transferred
+    assert_eq!(shared_progress.files_completed(), 3);
+    assert_eq!(shared_progress.bytes_transferred(), total_bytes);
+}

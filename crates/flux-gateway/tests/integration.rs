@@ -349,3 +349,89 @@ async fn test_gateway_transfer_live_progress_observability() {
     assert_eq!(body["files_transferred"], 1);
     assert_eq!(body["error_message"], "Simulated network timeout");
 }
+
+#[tokio::test]
+async fn test_gateway_transfer_continuity_across_session_replacement() {
+    let (url, _, state) = spawn_test_gateway().await;
+    let client = reqwest::Client::new();
+
+    let transfer_id = "logical-continuity-transfer-1".to_string();
+    let peer_id = "remote-peer-42".to_string();
+    let cancel_token = TransferCancellation::new();
+    let progress = TransferProgress::new();
+
+    let total_bytes = 10_000_000u64;
+    let total_files = 3usize;
+
+    // 1. Register logical transfer on Carrier Session 1
+    state
+        .tracker
+        .register(
+            transfer_id.clone(),
+            peer_id.clone(),
+            total_bytes,
+            total_files,
+            cancel_token,
+            progress.clone(),
+            None,
+        )
+        .await;
+
+    // 2. Carrier Session 1 transmits 5,000,000 bytes and completes File 1
+    progress.add_bytes(5_000_000);
+    progress.add_file();
+
+    let res = client
+        .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["transfer_id"], "logical-continuity-transfer-1");
+    assert_eq!(body["status"], "RUNNING");
+    assert_eq!(body["bytes_transferred"], 5_000_000);
+    assert_eq!(body["files_transferred"], 1);
+
+    // 3. Carrier Session 1 drops; Carrier Session 2 is attached to the same TransferId
+    let (_cont_cancel, cont_progress) = state
+        .tracker
+        .attach_continuation(&transfer_id, None)
+        .await
+        .expect("Transfer must be found in tracker");
+
+    // Same atomic references are retained
+    assert_eq!(cont_progress.bytes_transferred(), 5_000_000);
+    assert_eq!(cont_progress.files_completed(), 1);
+
+    // 4. Carrier Session 2 sends next 2,000,000 bytes
+    cont_progress.add_bytes(2_000_000);
+
+    let res = client
+        .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["transfer_id"], "logical-continuity-transfer-1");
+    assert_eq!(body["status"], "RUNNING");
+    assert_eq!(body["bytes_transferred"], 7_000_000);
+    assert_eq!(body["files_transferred"], 1);
+
+    // 5. Carrier Session 2 finishes all remaining bytes and files
+    cont_progress.add_bytes(3_000_000);
+    cont_progress.add_file();
+    cont_progress.add_file();
+    state.tracker.mark_completed(&transfer_id).await;
+
+    let res = client
+        .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["transfer_id"], "logical-continuity-transfer-1");
+    assert_eq!(body["status"], "COMPLETED");
+    assert_eq!(body["bytes_transferred"], 10_000_000);
+    assert_eq!(body["files_transferred"], 3);
+}
