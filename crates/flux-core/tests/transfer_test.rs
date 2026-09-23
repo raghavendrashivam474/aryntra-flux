@@ -710,3 +710,150 @@ async fn test_e2e_tcp_multi_file_resume() {
     assert!(!part_path.exists());
     assert!(!meta_path.exists());
 }
+
+// --- S3.3: Cancellation and Resume Integration Tests ---
+
+#[tokio::test]
+async fn test_e2e_cancellation_pre_transfer() {
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    let file_path = sender_dir.path().join("cancel_pre.bin");
+    create_test_file(&file_path, 128 * 1024).await;
+
+    let plan = TransferPlan::from_paths(&[file_path]).unwrap();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr();
+
+    let r_dir = receiver_dir.path().to_path_buf();
+    let r_id = remote_peer_id.clone();
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&r_id).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, r_id);
+        let _ = TransferManager::receive_collection(&mut session, &r_dir).await;
+        let _ = session.close().await;
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender = session_builder
+        .connect(&remote_peer_id, local_addr)
+        .await
+        .unwrap();
+
+    let cancel = flux_core::transfer::TransferCancellation::new();
+    cancel.cancel(); // Cancel before initiating
+
+    let res = TransferManager::send_collection_with_cancel(&mut session_sender, &plan, &cancel).await;
+    assert!(matches!(res, Err(TransferError::Cancelled)));
+
+    let _ = session_sender.close().await;
+    let _ = receiver_handle.await;
+}
+
+#[tokio::test]
+async fn test_e2e_cancellation_preserves_partial_state_and_resumes() {
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    // 500 KiB file (~8 chunks of 64 KiB)
+    let file_path = sender_dir.path().join("cancel_resume.bin");
+    let payload = create_test_file(&file_path, 500 * 1024).await;
+    let expected_hash = compute_hash(&payload);
+
+    let plan = TransferPlan::from_paths(std::slice::from_ref(&file_path)).unwrap();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    // Phase 1: Cancel mid-transfer
+    let transport_receiver = TcpTransport::new();
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr = listener.local_addr();
+
+    let cancel_token = flux_core::transfer::TransferCancellation::new();
+    let cancel_token_clone = cancel_token.clone();
+
+    let r_dir = receiver_dir.path().to_path_buf();
+    let r_id = remote_peer_id.clone();
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&r_id).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, r_id);
+        let _ = TransferManager::receive_collection(&mut session, &r_dir).await;
+        let _ = session.close().await;
+    });
+
+    let transport_sender = TcpTransport::new();
+    let session_builder = SessionBuilder::new(&transport_sender, local_peer_id.clone());
+    let mut session_sender = session_builder
+        .connect(&remote_peer_id, local_addr)
+        .await
+        .unwrap();
+
+    // Trigger cancel concurrently after a tiny delay
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+        cancel_token_clone.cancel();
+    });
+
+    let _ = TransferManager::send_collection_with_cancel(&mut session_sender, &plan, &cancel_token).await;
+    let _ = session_sender.close().await;
+    let _ = receiver_handle.await;
+
+    // Phase 2: Resume transfer to completion
+    let transport_receiver2 = TcpTransport::new();
+    let mut listener2 = transport_receiver2
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let local_addr2 = listener2.local_addr();
+
+    let r_dir2 = receiver_dir.path().to_path_buf();
+    let r_id2 = remote_peer_id.clone();
+    let receiver_handle2 = tokio::spawn(async move {
+        let (mut conn, _) = listener2.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&r_id2).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, r_id2);
+        TransferManager::receive_collection(&mut session, &r_dir2).await.unwrap();
+        session.close().await.unwrap();
+    });
+
+    let transport_sender2 = TcpTransport::new();
+    let session_builder2 = SessionBuilder::new(&transport_sender2, local_peer_id.clone());
+    let mut session_sender2 = session_builder2
+        .connect(&remote_peer_id, local_addr2)
+        .await
+        .unwrap();
+
+    TransferManager::send_collection(&mut session_sender2, &plan)
+        .await
+        .unwrap();
+    session_sender2.close().await.unwrap();
+
+    receiver_handle2.await.unwrap();
+
+    // Verify completed file integrity
+    let final_path = receiver_dir.path().join("cancel_resume.bin");
+    assert!(final_path.exists());
+    let received_data = fs::read(&final_path).await.unwrap();
+    assert_eq!(compute_hash(&received_data), expected_hash);
+}

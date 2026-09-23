@@ -1,5 +1,6 @@
 use super::chunker::Chunker;
 use super::collection::TransferPlan;
+use super::control::TransferCancellation;
 use super::error::{Result, TransferError};
 use super::metadata::TransferMetadata;
 use super::receiver::FileReceiver;
@@ -28,15 +29,30 @@ impl TransferManager {
 
     /// Send a single file over an established session.
     pub async fn send_file(session: &mut Session, file_path: &Path) -> Result<()> {
-        Self::send_file_internal(session, file_path, None).await
+        let cancel = TransferCancellation::new();
+        Self::send_file_with_cancel(session, file_path, &cancel).await
     }
 
-    /// Internal implementation of single-file sending supporting optional relative paths.
+    /// Send a single file over an established session with a cooperative cancellation token.
+    pub async fn send_file_with_cancel(
+        session: &mut Session,
+        file_path: &Path,
+        cancel: &TransferCancellation,
+    ) -> Result<()> {
+        Self::send_file_internal(session, file_path, None, cancel).await
+    }
+
+    /// Internal implementation of single-file sending supporting optional relative paths and cancellation.
     async fn send_file_internal(
         session: &mut Session,
         file_path: &Path,
         relative_path: Option<String>,
+        cancel: &TransferCancellation,
     ) -> Result<()> {
+        if cancel.is_cancelled() {
+            return Err(TransferError::Cancelled);
+        }
+
         let file_name = file_path
             .file_name()
             .ok_or_else(|| TransferError::InvalidFilename("no filename".to_string()))?
@@ -68,7 +84,7 @@ impl TransferManager {
             })
             .await?;
 
-        // 2. Wait for accept/reject/resume
+        // 2. Wait for accept/reject/resume/cancel
         let response = session.recv_message().await?;
         let start_chunk = match response {
             FluxMessage::TransferAccept { transfer_id } => {
@@ -97,6 +113,15 @@ impl TransferManager {
             FluxMessage::TransferReject { reason, .. } => {
                 return Err(TransferError::Rejected(reason));
             }
+            FluxMessage::TransferCancel { transfer_id } => {
+                if transfer_id == metadata.transfer_id {
+                    println!("  Transfer cancelled by remote peer");
+                    return Err(TransferError::Cancelled);
+                }
+                return Err(TransferError::UnexpectedMessage(
+                    "Transfer ID mismatch in cancel".to_string(),
+                ));
+            }
             other => {
                 return Err(TransferError::UnexpectedMessage(format!(
                     "Expected TransferAccept/TransferResume, got {:?}",
@@ -112,6 +137,17 @@ impl TransferManager {
         }
 
         while let Some((index, data)) = chunker.next_chunk().await? {
+            // Cooperative cancellation check before transmitting chunk
+            if cancel.is_cancelled() {
+                println!("\n  Transfer cancelled locally. Sending TransferCancel...");
+                let _ = session
+                    .send_message(&FluxMessage::TransferCancel {
+                        transfer_id: metadata.transfer_id,
+                    })
+                    .await;
+                return Err(TransferError::Cancelled);
+            }
+
             session
                 .send_message(&FluxMessage::TransferChunk {
                     transfer_id: metadata.transfer_id,
@@ -129,6 +165,17 @@ impl TransferManager {
             );
         }
         println!();
+
+        // Check cancellation before sending completion
+        if cancel.is_cancelled() {
+            println!("  Transfer cancelled locally before completion.");
+            let _ = session
+                .send_message(&FluxMessage::TransferCancel {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await;
+            return Err(TransferError::Cancelled);
+        }
 
         // 4. Signal complete
         session
@@ -153,6 +200,16 @@ impl TransferManager {
                     )))
                 }
             }
+            FluxMessage::TransferCancel { transfer_id } => {
+                if transfer_id == metadata.transfer_id {
+                    println!("  Transfer cancelled by remote peer");
+                    Err(TransferError::Cancelled)
+                } else {
+                    Err(TransferError::UnexpectedMessage(
+                        "Transfer ID mismatch in cancel".to_string(),
+                    ))
+                }
+            }
             other => Err(TransferError::UnexpectedMessage(format!(
                 "Expected TransferResult, got {:?}",
                 other
@@ -162,15 +219,30 @@ impl TransferManager {
 
     /// Orchestrate sending a complete collection sequentially over a single session.
     pub async fn send_collection(session: &mut Session, plan: &TransferPlan) -> Result<()> {
+        let cancel = TransferCancellation::new();
+        Self::send_collection_with_cancel(session, plan, &cancel).await
+    }
+
+    /// Orchestrate sending a complete collection sequentially with a cancellation token.
+    pub async fn send_collection_with_cancel(
+        session: &mut Session,
+        plan: &TransferPlan,
+        cancel: &TransferCancellation,
+    ) -> Result<()> {
         let total = plan.items.len();
         println!("Starting transfer of collection ({} items)...", total);
 
         for (idx, item) in plan.items.iter().enumerate() {
+            if cancel.is_cancelled() {
+                println!("\nCollection transfer cancelled before sending item {}", idx + 1);
+                return Err(TransferError::Cancelled);
+            }
+
             println!("\n[{}/{}] Sending file...", idx + 1, total);
             let relative_str = item.relative_path.to_string_lossy().to_string();
 
             if let Err(e) =
-                Self::send_file_internal(session, &item.source_path, Some(relative_str)).await
+                Self::send_file_internal(session, &item.source_path, Some(relative_str), cancel).await
             {
                 eprintln!("\nError sending item {}: {}", item.source_path.display(), e);
                 return Err(e);
@@ -189,6 +261,17 @@ impl TransferManager {
         session: &mut Session,
         metadata: TransferMetadata,
         output_dir: &Path,
+    ) -> Result<()> {
+        let cancel = TransferCancellation::new();
+        Self::receive_transfer_with_cancel(session, metadata, output_dir, &cancel).await
+    }
+
+    /// Handle an incoming transfer with cooperative cancellation.
+    pub async fn receive_transfer_with_cancel(
+        session: &mut Session,
+        metadata: TransferMetadata,
+        output_dir: &Path,
+        cancel: &TransferCancellation,
     ) -> Result<()> {
         println!("\n  Incoming transfer:");
         if let Some(ref rel) = metadata.relative_path {
@@ -227,6 +310,16 @@ impl TransferManager {
         // 2. Receive remaining chunks
         let remaining = metadata.total_chunks - start_chunk;
         for _ in 0..remaining {
+            if cancel.is_cancelled() {
+                println!("\n    Receiver cancelled locally. Preserving partial state.");
+                let _ = session
+                    .send_message(&FluxMessage::TransferCancel {
+                        transfer_id: metadata.transfer_id,
+                    })
+                    .await;
+                return Err(TransferError::Cancelled);
+            }
+
             let msg = session.recv_message().await?;
             match msg {
                 FluxMessage::TransferChunk {
@@ -243,6 +336,15 @@ impl TransferManager {
                     let (cur, tot) = receiver.progress();
                     print!("\r    Receiving: chunk {}/{}", cur, tot);
                 }
+                FluxMessage::TransferCancel { transfer_id } => {
+                    if transfer_id == metadata.transfer_id {
+                        println!("\n    Received TransferCancel from sender. Preserving partial state.");
+                        return Err(TransferError::Cancelled);
+                    }
+                    return Err(TransferError::UnexpectedMessage(
+                        "Transfer ID mismatch in cancel".to_string(),
+                    ));
+                }
                 other => {
                     return Err(TransferError::UnexpectedMessage(format!(
                         "Expected TransferChunk, got {:?}",
@@ -253,7 +355,17 @@ impl TransferManager {
         }
         println!();
 
-        // 3. Wait for TransferComplete
+        if cancel.is_cancelled() {
+            println!("    Receiver cancelled locally before finalization. Preserving partial state.");
+            let _ = session
+                .send_message(&FluxMessage::TransferCancel {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await;
+            return Err(TransferError::Cancelled);
+        }
+
+        // 3. Wait for TransferComplete or TransferCancel
         let msg = session.recv_message().await?;
         match msg {
             FluxMessage::TransferComplete { transfer_id } => {
@@ -262,6 +374,15 @@ impl TransferManager {
                         "Transfer ID mismatch in complete".to_string(),
                     ));
                 }
+            }
+            FluxMessage::TransferCancel { transfer_id } => {
+                if transfer_id == metadata.transfer_id {
+                    println!("    Received TransferCancel from sender before finalization.");
+                    return Err(TransferError::Cancelled);
+                }
+                return Err(TransferError::UnexpectedMessage(
+                    "Transfer ID mismatch in cancel".to_string(),
+                ));
             }
             other => {
                 return Err(TransferError::UnexpectedMessage(format!(
@@ -303,8 +424,23 @@ impl TransferManager {
     /// Run the receiver-side loop over an established session, accepting
     /// consecutive file transfers until a Goodbye message is received or the session closes.
     pub async fn receive_collection(session: &mut Session, output_dir: &Path) -> Result<()> {
+        let cancel = TransferCancellation::new();
+        Self::receive_collection_with_cancel(session, output_dir, &cancel).await
+    }
+
+    /// Run the receiver-side loop over an established session with a cancellation token.
+    pub async fn receive_collection_with_cancel(
+        session: &mut Session,
+        output_dir: &Path,
+        cancel: &TransferCancellation,
+    ) -> Result<()> {
         println!("Ready to receive collection...");
         loop {
+            if cancel.is_cancelled() {
+                println!("Receive collection cancelled.");
+                return Err(TransferError::Cancelled);
+            }
+
             let msg = match session.recv_message().await {
                 Ok(m) => m,
                 Err(e) => {
@@ -316,11 +452,15 @@ impl TransferManager {
 
             match msg {
                 FluxMessage::TransferRequest { metadata } => {
-                    Self::receive_transfer(session, metadata, output_dir).await?;
+                    Self::receive_transfer_with_cancel(session, metadata, output_dir, cancel).await?;
                 }
                 FluxMessage::Goodbye => {
                     println!("Goodbye received. Collection transfer completed successfully.");
                     break;
+                }
+                FluxMessage::TransferCancel { .. } => {
+                    println!("TransferCancel received at collection level.");
+                    return Err(TransferError::Cancelled);
                 }
                 other => {
                     return Err(TransferError::UnexpectedMessage(format!(
