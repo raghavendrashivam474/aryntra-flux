@@ -1,5 +1,6 @@
-use super::chunker::Chunker;
+﻿use super::chunker::Chunker;
 use super::collection::TransferPlan;
+use super::continuity::TransferContinuation;
 use super::control::TransferCancellation;
 use super::error::{Result, TransferError};
 use super::metadata::TransferMetadata;
@@ -571,6 +572,76 @@ impl TransferManager {
                 }
             }
         }
+        Ok(())
+    }
+    /// Continue an interrupted collection transfer on a new session.
+    ///
+    /// Skips files that were already fully completed and resumes the first
+    /// incomplete file using the existing checkpoint/resume mechanism.
+    /// The shared `TransferProgress` and `TransferCancellation` are preserved
+    /// from the original transfer, ensuring logical continuity.
+    pub async fn continue_collection(
+        session: &mut Session,
+        continuation: &TransferContinuation,
+    ) -> Result<()> {
+        if continuation.is_complete() {
+            println!("Collection already complete, nothing to continue.");
+            return Ok(());
+        }
+
+        let total = continuation.plan.items.len();
+        let start = continuation.completed_files;
+        println!(
+            "Continuing collection: {}/{} files done, resuming from file {}",
+            start,
+            total,
+            start + 1
+        );
+
+        // Calibrate progress tracker to the verified baseline of completed files
+        let mut completed_bytes = 0u64;
+        for item in &continuation.plan.items[..start] {
+            if let Ok(meta) = tokio::fs::metadata(&item.source_path).await {
+                completed_bytes += meta.len();
+            }
+        }
+        continuation.progress.set_bytes(completed_bytes);
+        continuation.progress.set_files(start);
+
+        for (idx, item) in continuation.plan.items.iter().enumerate().skip(start) {
+            if continuation.cancel.is_cancelled() {
+                println!(
+                    "\nCollection continuation cancelled before item {}",
+                    idx + 1
+                );
+                return Err(TransferError::Cancelled);
+            }
+
+            println!("\n[{}/{}] Continuing file...", idx + 1, total);
+            let relative_str = item.relative_path.to_string_lossy().to_string();
+
+            if let Err(e) = Self::send_file_internal(
+                session,
+                &item.source_path,
+                Some(relative_str),
+                &continuation.cancel,
+                &continuation.progress,
+            )
+            .await
+            {
+                eprintln!(
+                    "\nError continuing item {}: {}",
+                    item.source_path.display(),
+                    e
+                );
+                return Err(e);
+            }
+
+            continuation.progress.add_file();
+        }
+
+        println!("\nCollection continuation complete. Sending termination handshake...");
+        session.send_message(&FluxMessage::Goodbye).await?;
         Ok(())
     }
 }

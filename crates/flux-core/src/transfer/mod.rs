@@ -1,5 +1,6 @@
 ﻿pub mod chunker;
 pub mod collection;
+pub mod continuity;
 pub mod control;
 pub mod error;
 pub mod manager;
