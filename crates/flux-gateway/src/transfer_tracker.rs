@@ -1,4 +1,4 @@
-use flux_core::transfer::TransferCancellation;
+use flux_core::transfer::{TransferCancellation, TransferProgress};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -30,6 +30,7 @@ pub struct GatewayTransferInfo {
 pub struct ActiveTransfer {
     pub info: GatewayTransferInfo,
     pub cancel_token: TransferCancellation,
+    pub progress: TransferProgress,
     pub task_handle: Option<JoinHandle<()>>,
 }
 
@@ -45,6 +46,7 @@ impl GatewayTransferTracker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
         transfer_id: String,
@@ -52,6 +54,7 @@ impl GatewayTransferTracker {
         total_bytes: u64,
         total_files: usize,
         cancel_token: TransferCancellation,
+        progress: TransferProgress,
         task_handle: Option<JoinHandle<()>>,
     ) {
         let mut guard = self.transfers.write().await;
@@ -69,6 +72,7 @@ impl GatewayTransferTracker {
                     error_message: None,
                 },
                 cancel_token,
+                progress,
                 task_handle,
             },
         );
@@ -76,7 +80,18 @@ impl GatewayTransferTracker {
 
     pub async fn get(&self, transfer_id: &str) -> Option<GatewayTransferInfo> {
         let guard = self.transfers.read().await;
-        guard.get(transfer_id).map(|t| t.info.clone())
+        guard.get(transfer_id).map(|t| {
+            let mut info = t.info.clone();
+            // Read live atomic progress snapshots if active
+            if matches!(
+                info.status,
+                TransferStatus::Created | TransferStatus::Running
+            ) {
+                info.bytes_transferred = t.progress.bytes_transferred();
+                info.files_transferred = t.progress.files_completed();
+            }
+            info
+        })
     }
 
     pub async fn active_count(&self) -> usize {
@@ -95,6 +110,7 @@ impl GatewayTransferTracker {
     pub async fn update_progress(&self, transfer_id: &str, bytes: u64, files: usize) {
         let mut guard = self.transfers.write().await;
         if let Some(transfer) = guard.get_mut(transfer_id) {
+            transfer.progress.set_bytes(bytes);
             transfer.info.bytes_transferred = bytes;
             transfer.info.files_transferred = files;
         }
@@ -123,6 +139,8 @@ impl GatewayTransferTracker {
                 || transfer.info.status == TransferStatus::Created
             {
                 transfer.info.status = TransferStatus::Failed;
+                transfer.info.bytes_transferred = transfer.progress.bytes_transferred();
+                transfer.info.files_transferred = transfer.progress.files_completed();
                 transfer.info.error_message = Some(error);
                 transfer.task_handle = None;
             }
@@ -136,6 +154,8 @@ impl GatewayTransferTracker {
                 || transfer.info.status == TransferStatus::Created
             {
                 transfer.info.status = TransferStatus::Cancelled;
+                transfer.info.bytes_transferred = transfer.progress.bytes_transferred();
+                transfer.info.files_transferred = transfer.progress.files_completed();
                 transfer.task_handle = None;
             }
         }
@@ -153,6 +173,8 @@ impl GatewayTransferTracker {
                 // Trigger cooperative cancellation in flux-core
                 transfer.cancel_token.cancel();
                 transfer.info.status = TransferStatus::Cancelled;
+                transfer.info.bytes_transferred = transfer.progress.bytes_transferred();
+                transfer.info.files_transferred = transfer.progress.files_completed();
                 return true;
             }
         }

@@ -1,4 +1,4 @@
-use crate::error::{GatewayError, GatewayResult};
+﻿use crate::error::{GatewayError, GatewayResult};
 use crate::state::GatewayState;
 use crate::transfer_tracker::GatewayTransferInfo;
 use axum::{
@@ -7,7 +7,9 @@ use axum::{
     Json, Router,
 };
 use flux_core::session::Session;
-use flux_core::transfer::{TransferCancellation, TransferError, TransferManager, TransferPlan};
+use flux_core::transfer::{
+    TransferCancellation, TransferError, TransferManager, TransferPlan, TransferProgress,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -99,6 +101,7 @@ async fn start_transfer(
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let total_files = plan.len();
     let cancel_token = TransferCancellation::new();
+    let progress = TransferProgress::new();
 
     // 4. Initialize return guard for the task
     let mut guard = SessionReturnGuard {
@@ -110,13 +113,20 @@ async fn start_transfer(
     let tracker_clone = state.tracker.clone();
     let transfer_id_clone = transfer_id.clone();
     let cancel_clone = cancel_token.clone();
+    let progress_clone = progress.clone();
 
-    // 5. Spawn background Transfer Execution Task with cooperative cancellation
+    // 5. Spawn background Transfer Execution Task with cooperative cancellation and progress tracking
     let task_handle = tokio::spawn(async move {
         guard.session = Some(session);
 
         let session_ref = guard.session.as_mut().unwrap();
-        match TransferManager::send_collection_with_cancel(session_ref, &plan, &cancel_clone).await
+        match TransferManager::send_collection_with_cancel_and_progress(
+            session_ref,
+            &plan,
+            &cancel_clone,
+            &progress_clone,
+        )
+        .await
         {
             Ok(()) => {
                 tracing::info!("Transfer {} completed successfully.", transfer_id_clone);
@@ -135,7 +145,7 @@ async fn start_transfer(
         }
     });
 
-    // 6. Register running transfer in Tracker with cooperative token
+    // 6. Register running transfer in Tracker with cooperative token and progress tracker
     state
         .tracker
         .register(
@@ -144,6 +154,7 @@ async fn start_transfer(
             total_bytes,
             total_files,
             cancel_token,
+            progress,
             Some(task_handle),
         )
         .await;
