@@ -1,4 +1,4 @@
-﻿pub mod discovery;
+pub mod discovery;
 pub mod identity;
 pub mod node;
 pub mod peer;
@@ -22,5 +22,6 @@ pub use session::{Session, SessionBuilder, SessionState};
 // S1.4: File transfer
 pub mod transfer;
 pub use transfer::{
-    CollectionError, TransferId, TransferItem, TransferManager, TransferMetadata, TransferPlan,
+    CollectionError, TransferCancellation, TransferId, TransferItem, TransferManager,
+    TransferMetadata, TransferPlan, TransferProgress,
 };

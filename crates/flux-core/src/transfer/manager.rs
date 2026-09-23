@@ -3,6 +3,7 @@ use super::collection::TransferPlan;
 use super::control::TransferCancellation;
 use super::error::{Result, TransferError};
 use super::metadata::TransferMetadata;
+use super::progress::TransferProgress;
 use super::receiver::FileReceiver;
 use crate::protocol::FluxMessage;
 use crate::session::Session;
@@ -39,15 +40,27 @@ impl TransferManager {
         file_path: &Path,
         cancel: &TransferCancellation,
     ) -> Result<()> {
-        Self::send_file_internal(session, file_path, None, cancel).await
+        let progress = TransferProgress::new();
+        Self::send_file_internal(session, file_path, None, cancel, &progress).await
     }
 
-    /// Internal implementation of single-file sending supporting optional relative paths and cancellation.
+    /// Send a single file over an established session with cancellation and progress reporting.
+    pub async fn send_file_with_cancel_and_progress(
+        session: &mut Session,
+        file_path: &Path,
+        cancel: &TransferCancellation,
+        progress: &TransferProgress,
+    ) -> Result<()> {
+        Self::send_file_internal(session, file_path, None, cancel, progress).await
+    }
+
+    /// Internal implementation of single-file sending supporting optional relative paths, cancellation, and progress.
     async fn send_file_internal(
         session: &mut Session,
         file_path: &Path,
         relative_path: Option<String>,
         cancel: &TransferCancellation,
+        progress: &TransferProgress,
     ) -> Result<()> {
         if cancel.is_cancelled() {
             return Err(TransferError::Cancelled);
@@ -108,6 +121,10 @@ impl TransferManager {
                     "  Resuming from chunk {}/{}",
                     resume_from_chunk, metadata.total_chunks
                 );
+                // Credit already verified bytes to progress on resume
+                let resumed_bytes = (resume_from_chunk as u64) * (metadata.chunk_size as u64);
+                let actual_resumed_bytes = resumed_bytes.min(metadata.file_size);
+                progress.add_bytes(actual_resumed_bytes);
                 resume_from_chunk
             }
             FluxMessage::TransferReject { reason, .. } => {
@@ -148,6 +165,8 @@ impl TransferManager {
                 return Err(TransferError::Cancelled);
             }
 
+            let chunk_len = data.len() as u64;
+
             session
                 .send_message(&FluxMessage::TransferChunk {
                     transfer_id: metadata.transfer_id,
@@ -155,6 +174,9 @@ impl TransferManager {
                     data,
                 })
                 .await?;
+
+            // Record progress immediately upon successful transmission
+            progress.add_bytes(chunk_len);
 
             let (cur, tot) = chunker.progress();
             print!(
@@ -229,6 +251,17 @@ impl TransferManager {
         plan: &TransferPlan,
         cancel: &TransferCancellation,
     ) -> Result<()> {
+        let progress = TransferProgress::new();
+        Self::send_collection_with_cancel_and_progress(session, plan, cancel, &progress).await
+    }
+
+    /// Orchestrate sending a complete collection sequentially with cancellation and progress reporting.
+    pub async fn send_collection_with_cancel_and_progress(
+        session: &mut Session,
+        plan: &TransferPlan,
+        cancel: &TransferCancellation,
+        progress: &TransferProgress,
+    ) -> Result<()> {
         let total = plan.items.len();
         println!("Starting transfer of collection ({} items)...", total);
 
@@ -244,13 +277,21 @@ impl TransferManager {
             println!("\n[{}/{}] Sending file...", idx + 1, total);
             let relative_str = item.relative_path.to_string_lossy().to_string();
 
-            if let Err(e) =
-                Self::send_file_internal(session, &item.source_path, Some(relative_str), cancel)
-                    .await
+            if let Err(e) = Self::send_file_internal(
+                session,
+                &item.source_path,
+                Some(relative_str),
+                cancel,
+                progress,
+            )
+            .await
             {
                 eprintln!("\nError sending item {}: {}", item.source_path.display(), e);
                 return Err(e);
             }
+
+            // File completed successfully
+            progress.add_file();
         }
 
         // Send collection completion signal over the session
@@ -267,15 +308,34 @@ impl TransferManager {
         output_dir: &Path,
     ) -> Result<()> {
         let cancel = TransferCancellation::new();
-        Self::receive_transfer_with_cancel(session, metadata, output_dir, &cancel).await
+        let progress = TransferProgress::new();
+        Self::receive_transfer_with_cancel_and_progress(
+            session, metadata, output_dir, &cancel, &progress,
+        )
+        .await
     }
 
-    /// Handle an incoming transfer with cooperative cancellation.
+    /// Handle an incoming transfer with a cancellation token.
     pub async fn receive_transfer_with_cancel(
         session: &mut Session,
         metadata: TransferMetadata,
         output_dir: &Path,
         cancel: &TransferCancellation,
+    ) -> Result<()> {
+        let progress = TransferProgress::new();
+        Self::receive_transfer_with_cancel_and_progress(
+            session, metadata, output_dir, cancel, &progress,
+        )
+        .await
+    }
+
+    /// Handle an incoming transfer with cancellation and progress reporting.
+    pub async fn receive_transfer_with_cancel_and_progress(
+        session: &mut Session,
+        metadata: TransferMetadata,
+        output_dir: &Path,
+        cancel: &TransferCancellation,
+        progress: &TransferProgress,
     ) -> Result<()> {
         println!("\n  Incoming transfer:");
         if let Some(ref rel) = metadata.relative_path {
@@ -291,6 +351,10 @@ impl TransferManager {
             match FileReceiver::try_resume(metadata.clone(), output_dir).await? {
                 Some(r) => {
                     let from = r.resume_from_chunk();
+                    let bytes_already = (from as u64) * (metadata.chunk_size as u64);
+                    let actual_bytes_already = bytes_already.min(metadata.file_size);
+                    progress.add_bytes(actual_bytes_already);
+
                     println!("    Resuming from chunk {}/{}", from, metadata.total_chunks);
                     session
                         .send_message(&FluxMessage::TransferResume {
@@ -336,7 +400,10 @@ impl TransferManager {
                             "Transfer ID mismatch in chunk".to_string(),
                         ));
                     }
+                    let chunk_len = data.len() as u64;
                     receiver.write_chunk(index, &data).await?;
+                    progress.add_bytes(chunk_len);
+
                     let (cur, tot) = receiver.progress();
                     print!("\r    Receiving: chunk {}/{}", cur, tot);
                 }
@@ -400,6 +467,16 @@ impl TransferManager {
             }
         }
 
+        if cancel.is_cancelled() {
+            println!("    Receiver cancelled locally after receiving TransferComplete.");
+            let _ = session
+                .send_message(&FluxMessage::TransferCancel {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await;
+            return Err(TransferError::Cancelled);
+        }
+
         // 4. Finalize and verify
         print!("    Verifying integrity... ");
         match receiver.finalize().await {
@@ -442,6 +519,18 @@ impl TransferManager {
         output_dir: &Path,
         cancel: &TransferCancellation,
     ) -> Result<()> {
+        let progress = TransferProgress::new();
+        Self::receive_collection_with_cancel_and_progress(session, output_dir, cancel, &progress)
+            .await
+    }
+
+    /// Run the receiver-side loop over an established session with cancellation and progress reporting.
+    pub async fn receive_collection_with_cancel_and_progress(
+        session: &mut Session,
+        output_dir: &Path,
+        cancel: &TransferCancellation,
+        progress: &TransferProgress,
+    ) -> Result<()> {
         println!("Ready to receive collection...");
         loop {
             if cancel.is_cancelled() {
@@ -460,8 +549,11 @@ impl TransferManager {
 
             match msg {
                 FluxMessage::TransferRequest { metadata } => {
-                    Self::receive_transfer_with_cancel(session, metadata, output_dir, cancel)
-                        .await?;
+                    Self::receive_transfer_with_cancel_and_progress(
+                        session, metadata, output_dir, cancel, progress,
+                    )
+                    .await?;
+                    progress.add_file();
                 }
                 FluxMessage::Goodbye => {
                     println!("Goodbye received. Collection transfer completed successfully.");
