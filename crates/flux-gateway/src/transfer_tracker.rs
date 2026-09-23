@@ -1,3 +1,4 @@
+use flux_core::transfer::TransferCancellation;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -28,6 +29,7 @@ pub struct GatewayTransferInfo {
 
 pub struct ActiveTransfer {
     pub info: GatewayTransferInfo,
+    pub cancel_token: TransferCancellation,
     pub task_handle: Option<JoinHandle<()>>,
 }
 
@@ -49,6 +51,7 @@ impl GatewayTransferTracker {
         peer_id: String,
         total_bytes: u64,
         total_files: usize,
+        cancel_token: TransferCancellation,
         task_handle: Option<JoinHandle<()>>,
     ) {
         let mut guard = self.transfers.write().await;
@@ -65,6 +68,7 @@ impl GatewayTransferTracker {
                     total_files,
                     error_message: None,
                 },
+                cancel_token,
                 task_handle,
             },
         );
@@ -99,31 +103,55 @@ impl GatewayTransferTracker {
     pub async fn mark_completed(&self, transfer_id: &str) {
         let mut guard = self.transfers.write().await;
         if let Some(transfer) = guard.get_mut(transfer_id) {
-            transfer.info.status = TransferStatus::Completed;
-            transfer.info.bytes_transferred = transfer.info.total_bytes;
-            transfer.info.files_transferred = transfer.info.total_files;
-            transfer.task_handle = None;
+            // Lifecycle guard: cannot complete if already cancelled or failed
+            if transfer.info.status == TransferStatus::Running
+                || transfer.info.status == TransferStatus::Created
+            {
+                transfer.info.status = TransferStatus::Completed;
+                transfer.info.bytes_transferred = transfer.info.total_bytes;
+                transfer.info.files_transferred = transfer.info.total_files;
+                transfer.task_handle = None;
+            }
         }
     }
 
     pub async fn mark_failed(&self, transfer_id: &str, error: String) {
         let mut guard = self.transfers.write().await;
         if let Some(transfer) = guard.get_mut(transfer_id) {
-            transfer.info.status = TransferStatus::Failed;
-            transfer.info.error_message = Some(error);
-            transfer.task_handle = None;
+            // Lifecycle guard: cannot fail if already cancelled or completed
+            if transfer.info.status == TransferStatus::Running
+                || transfer.info.status == TransferStatus::Created
+            {
+                transfer.info.status = TransferStatus::Failed;
+                transfer.info.error_message = Some(error);
+                transfer.task_handle = None;
+            }
         }
     }
 
+    pub async fn mark_cancelled(&self, transfer_id: &str) {
+        let mut guard = self.transfers.write().await;
+        if let Some(transfer) = guard.get_mut(transfer_id) {
+            if transfer.info.status == TransferStatus::Running
+                || transfer.info.status == TransferStatus::Created
+            {
+                transfer.info.status = TransferStatus::Cancelled;
+                transfer.task_handle = None;
+            }
+        }
+    }
+
+    /// Cooperatively cancel a transfer.
+    /// Returns true if the transfer was running/created and cancellation was triggered.
+    /// Returns false if transfer was not found or was already completed/failed/cancelled.
     pub async fn cancel(&self, transfer_id: &str) -> bool {
         let mut guard = self.transfers.write().await;
         if let Some(transfer) = guard.get_mut(transfer_id) {
             if transfer.info.status == TransferStatus::Running
                 || transfer.info.status == TransferStatus::Created
             {
-                if let Some(handle) = transfer.task_handle.take() {
-                    handle.abort();
-                }
+                // Trigger cooperative cancellation in flux-core
+                transfer.cancel_token.cancel();
                 transfer.info.status = TransferStatus::Cancelled;
                 return true;
             }

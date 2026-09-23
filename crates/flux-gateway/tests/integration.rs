@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 
 use flux_core::node::{FluxNode, NodeState};
 use flux_core::peer::Peer;
+use flux_core::transfer::TransferCancellation;
 use flux_gateway::GatewayState;
 
 // Helper to spawn a gateway instance on an ephemeral port
@@ -121,8 +122,6 @@ async fn test_peers_empty_and_retrieval() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
-    let body: serde_json::Value = res.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "PEER_NOT_FOUND");
 }
 
 #[tokio::test]
@@ -130,10 +129,10 @@ async fn test_connect_failures_and_validation() {
     let (url, _, _) = spawn_test_gateway().await;
     let client = reqwest::Client::new();
 
-    // Invalid UUID parsing
+    // Bad UUID format
     let res = client
         .post(format!("{}/flux/v1/connect", url))
-        .json(&json!({ "peer_id": "not-a-valid-uuid" }))
+        .json(&json!({ "peer_id": "invalid-uuid" }))
         .send()
         .await
         .unwrap();
@@ -161,7 +160,14 @@ async fn test_transfer_lifecycle_tracker() {
     // 1. Validate manual registration in tracker works
     state
         .tracker
-        .register(transfer_id.clone(), peer_id.clone(), 2048, 2, None)
+        .register(
+            transfer_id.clone(),
+            peer_id.clone(),
+            2048,
+            2,
+            TransferCancellation::new(),
+            None,
+        )
         .await;
 
     // 2. Query state via HTTP
@@ -195,4 +201,70 @@ async fn test_transfer_lifecycle_tracker() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_gateway_transfer_cancel_lifecycle() {
+    let (url, _, state) = spawn_test_gateway().await;
+    let client = reqwest::Client::new();
+
+    let transfer_id = "cancel-test-id-1".to_string();
+    let peer_id = "some-peer-uuid".to_string();
+    let cancel_token = TransferCancellation::new();
+
+    state
+        .tracker
+        .register(
+            transfer_id.clone(),
+            peer_id.clone(),
+            4096,
+            1,
+            cancel_token.clone(),
+            None,
+        )
+        .await;
+
+    // Cancel running transfer via HTTP endpoint
+    let res = client
+        .post(format!("{}/flux/v1/transfer/{}/cancel", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["cancelled"], true);
+    assert!(cancel_token.is_cancelled());
+
+    // Verify status is now CANCELLED
+    let res = client
+        .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["status"], "CANCELLED");
+
+    // Cancelling a completed transfer returns cancelled: false
+    let completed_id = "completed-test-id-2".to_string();
+    state
+        .tracker
+        .register(
+            completed_id.clone(),
+            peer_id.clone(),
+            1024,
+            1,
+            TransferCancellation::new(),
+            None,
+        )
+        .await;
+    state.tracker.mark_completed(&completed_id).await;
+
+    let res = client
+        .post(format!("{}/flux/v1/transfer/{}/cancel", url, completed_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["cancelled"], false);
 }

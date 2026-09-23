@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use flux_core::session::Session;
-use flux_core::transfer::{TransferManager, TransferPlan};
+use flux_core::transfer::{TransferCancellation, TransferError, TransferManager, TransferPlan};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ pub fn routes() -> Router<GatewayState> {
 }
 
 /// Guard to guarantee the Session is returned back to the active sessions map
-/// even if the transfer task is completed, failed, panicked, or aborted.
+/// even if the transfer task is completed, failed, panicked, or cancelled.
 struct SessionReturnGuard {
     peer_id: String,
     session: Option<Session>,
@@ -98,8 +98,9 @@ async fn start_transfer(
 
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let total_files = plan.len();
+    let cancel_token = TransferCancellation::new();
 
-    // 4. Initialize return guard for the thread
+    // 4. Initialize return guard for the task
     let mut guard = SessionReturnGuard {
         peer_id: payload.peer_id.clone(),
         session: None,
@@ -108,17 +109,21 @@ async fn start_transfer(
 
     let tracker_clone = state.tracker.clone();
     let transfer_id_clone = transfer_id.clone();
+    let cancel_clone = cancel_token.clone();
 
-    // 5. Spawn background Transfer Execution Task
+    // 5. Spawn background Transfer Execution Task with cooperative cancellation
     let task_handle = tokio::spawn(async move {
-        // Transfer custody of session into the task execution loop
         guard.session = Some(session);
 
         let session_ref = guard.session.as_mut().unwrap();
-        match TransferManager::send_collection(session_ref, &plan).await {
+        match TransferManager::send_collection_with_cancel(session_ref, &plan, &cancel_clone).await {
             Ok(()) => {
                 tracing::info!("Transfer {} completed successfully.", transfer_id_clone);
                 tracker_clone.mark_completed(&transfer_id_clone).await;
+            }
+            Err(TransferError::Cancelled) => {
+                tracing::info!("Transfer {} cancelled cooperatively.", transfer_id_clone);
+                tracker_clone.mark_cancelled(&transfer_id_clone).await;
             }
             Err(e) => {
                 tracing::error!("Transfer {} failed: {}", transfer_id_clone, e);
@@ -127,10 +132,9 @@ async fn start_transfer(
                     .await;
             }
         }
-        // When task exits or is dropped, guard drops, inserting session back to pool
     });
 
-    // 6. Register running transfer in Tracker
+    // 6. Register running transfer in Tracker with cooperative token
     state
         .tracker
         .register(
@@ -138,6 +142,7 @@ async fn start_transfer(
             payload.peer_id,
             total_bytes,
             total_files,
+            cancel_token,
             Some(task_handle),
         )
         .await;
