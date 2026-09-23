@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "flux-node"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 
 [dependencies]
@@ -9,3 +9,4 @@ clap = { version = "4.4", features = ["derive"] }
 tokio = { version = "1.35", features = ["full"] }
 anyhow = "1.0"
 env_logger = "0.10"
+

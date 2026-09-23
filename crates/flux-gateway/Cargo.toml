@@ -1,6 +1,6 @@
-[package]
+﻿[package]
 name = "flux-gateway"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 authors = ["Aryntra Project"]
 description = "HTTP Gateway adapter for Aryntra Flux"
@@ -29,3 +29,4 @@ uuid = { version = "1.8", features = ["v4", "serde"] }
 [dev-dependencies]
 tokio = { version = "1.38", features = ["full", "test-util"] }
 reqwest = { version = "0.12", features = ["json"] }
+

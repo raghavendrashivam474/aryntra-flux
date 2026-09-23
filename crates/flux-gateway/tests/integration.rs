@@ -1,4 +1,4 @@
-﻿use flux_core::transfer::TransferProgress;
+use flux_core::transfer::TransferProgress;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::sync::Arc;
@@ -349,4 +349,3 @@ async fn test_gateway_transfer_live_progress_observability() {
     assert_eq!(body["files_transferred"], 1);
     assert_eq!(body["error_message"], "Simulated network timeout");
 }
-
