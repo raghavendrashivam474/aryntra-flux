@@ -60,6 +60,10 @@ pub enum FluxMessage {
         transfer_id: TransferId,
         resume_from_chunk: u32,
     },
+
+    // --- S3.3: Transfer control messages ---
+    /// Cooperative cancellation of an in-progress transfer
+    TransferCancel { transfer_id: TransferId },
 }
 
 impl FluxMessage {
@@ -157,5 +161,17 @@ mod tests {
         let encoded = crate::protocol::framing::encode_message(&resume).unwrap();
         let decoded = crate::protocol::framing::decode_message(&encoded[4..]).unwrap();
         assert_eq!(resume, decoded);
+    }
+
+    #[test]
+    fn test_transfer_cancel_serialize() {
+        use crate::transfer::TransferId;
+
+        let tid = TransferId::new_v4();
+        let cancel = FluxMessage::TransferCancel { transfer_id: tid };
+
+        let encoded = crate::protocol::framing::encode_message(&cancel).unwrap();
+        let decoded = crate::protocol::framing::decode_message(&encoded[4..]).unwrap();
+        assert_eq!(cancel, decoded);
     }
 }

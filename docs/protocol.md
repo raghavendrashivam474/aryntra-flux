@@ -1,4 +1,4 @@
-﻿# Flux Wire Protocol (v0.1.0)
+# Flux Wire Protocol (v0.1.0)
 
 ## 1. Overview
 The Flux wire protocol is a message-oriented protocol operating over reliable binary stream transports (like TCP or QUIC).
@@ -37,6 +37,9 @@ Prior to establishing an active communication channel, peers execute a two-way i
 
 ### Transfer Resume Messages (S1.5)
 - **TransferResume (Type: TransferResume)**: `transfer_id: TransferId`, `resume_from_chunk: u32` (receiver informs sender of existing partial state and the chunk index to resume from; sent instead of TransferAccept when valid partial state exists).
+
+### Transfer Control Messages (S3.3)
+- **TransferCancel (Type: TransferCancel)**: `transfer_id: TransferId` (cooperative cancellation signal sent over-the-wire by either sender or receiver to terminate the transfer cleanly without breaking session state, preserving any partial `.part` / `.part.meta` state on disk).
 
 ## 6. S1.6 Collection Flow
 Multi-file and directory transfers reuse the established session sequentially:

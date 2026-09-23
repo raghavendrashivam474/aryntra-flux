@@ -1,4 +1,4 @@
-﻿use thiserror::Error;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum TransferError {
@@ -25,6 +25,9 @@ pub enum TransferError {
 
     #[error("Invalid filename: {0}")]
     InvalidFilename(String),
+
+    #[error("Transfer cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, TransferError>;
