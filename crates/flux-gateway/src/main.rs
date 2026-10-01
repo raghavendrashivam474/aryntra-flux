@@ -1,5 +1,6 @@
-use flux_core::node::FluxNode;
+﻿use flux_core::node::FluxNode;
 use flux_gateway::{GatewayServer, GatewayState};
+use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
@@ -28,7 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_arc = Arc::new(node);
     let state = GatewayState::new(node_arc);
 
-    let bind_addr: SocketAddr = "127.0.0.1:9100".parse()?;
+    let bind_str = env::var("FLUX_GATEWAY_BIND").unwrap_or_else(|_| "0.0.0.0:9100".to_string());
+    let bind_addr: SocketAddr = bind_str.parse()?;
     info!("Starting Aryntra Flux HTTP Gateway on http://{}", bind_addr);
 
     let server = GatewayServer::new(state, bind_addr);
