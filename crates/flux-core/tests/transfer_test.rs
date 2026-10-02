@@ -1887,3 +1887,628 @@ async fn test_e2e_carrier_migration_fails_when_no_backup_path() {
         "Partial .part.meta file must be preserved"
     );
 }
+
+// ============================================================================
+
+// ============================================================================
+// --- S3.8: Sender-Side Chunk Checkpointing & Efficient Migration Tests ---
+// ============================================================================
+
+#[tokio::test]
+async fn test_s38_chunker_resume_efficiency() {
+    // Proves that seeking to chunk N does not read chunks 0..N-1
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("efficient_seek.bin");
+    let chunk_size = 64 * 1024;
+    let total_chunks_count = 10;
+    let payload_size = (total_chunks_count * chunk_size) as usize;
+    let original = create_test_file(&file_path, payload_size).await;
+
+    let mut chunker = Chunker::new(&file_path, chunk_size).await.unwrap();
+    assert_eq!(chunker.total_chunks(), total_chunks_count);
+
+    // Seek directly to chunk 6 (skipping 0..5)
+    chunker.seek_to_chunk(6).await.unwrap();
+    assert_eq!(chunker.bytes_read(), (6 * chunk_size) as u64);
+
+    let (idx, data) = chunker.next_chunk().await.unwrap().unwrap();
+    assert_eq!(idx, 6);
+    assert_eq!(data.len(), chunk_size as usize);
+    let expected_slice = &original[(6 * chunk_size as usize)..(7 * chunk_size as usize)];
+    assert_eq!(&data[..], expected_slice);
+}
+
+#[tokio::test]
+async fn test_s38_e2e_efficient_carrier_migration_chunk_boundary() {
+    use flux_core::path::metrics::PathMetrics;
+    use flux_core::path::{Path, PathRegistry, PathState, TransportKind};
+    use flux_core::session::SessionBuilder;
+    use flux_core::transfer::{
+        MigrationState, TransferCancellation, TransferCarrier, TransferProgress,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    // 16 chunks of 64 KiB = 1,048,576 bytes (1 MiB)
+    let chunk_size = 64 * 1024;
+    let total_chunks = 16u32;
+    let file_size = (total_chunks * chunk_size) as usize;
+    let file_path = sender_dir.path().join("chunk_efficient.bin");
+    let original_payload = create_test_file(&file_path, file_size).await;
+    let expected_hash = compute_hash(&original_payload);
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    // Setup Path A
+    let transport_receiver_a = TcpTransport::new();
+    let mut listener_a = transport_receiver_a
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_a = listener_a.local_addr();
+    let remote_id_spawn_a = remote_peer_id.clone();
+    let receiver_dir_spawn_a = receiver_dir.path().to_path_buf();
+
+    // Setup Path B
+    let transport_receiver_b = TcpTransport::new();
+    let mut listener_b = transport_receiver_b
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_b = listener_b.local_addr();
+    let remote_id_spawn_b = remote_peer_id.clone();
+    let receiver_dir_spawn_b = receiver_dir.path().to_path_buf();
+
+    // Register paths
+    let registry = PathRegistry::new();
+    let mut path_a = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_path_a);
+    path_a.state = PathState::Available;
+    path_a.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(10)));
+    let path_a_id = path_a.id.clone();
+    registry.register_path(path_a);
+
+    let mut path_b = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_path_b);
+    path_b.state = PathState::Available;
+    path_b.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(30)));
+    let path_b_id = path_b.id.clone();
+    registry.register_path(path_b);
+
+    let fail_at_chunk = 6u32; // Chunks 0..5 completed on Path A, chunk 6 causes failure
+    let path_b_chunks_received = Arc::new(AtomicU32::new(0));
+    let path_b_first_chunk = Arc::new(AtomicU32::new(9999));
+
+    // Receiver on Path A: receives exactly `fail_at_chunk` (0..5), then abruptly drops connection
+    let receiver_handle_a = tokio::spawn(async move {
+        let (mut conn, _) = listener_a.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_a).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, remote_id_spawn_a);
+        let first_msg = session.recv_message().await.unwrap();
+        if let FluxMessage::TransferRequest { metadata } = first_msg {
+            let mut receiver = FileReceiver::new(metadata.clone(), &receiver_dir_spawn_a)
+                .await
+                .unwrap();
+            session
+                .send_message(&FluxMessage::TransferAccept {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await
+                .unwrap();
+
+            for _ in 0..fail_at_chunk {
+                if let FluxMessage::TransferChunk { index, data, .. } =
+                    session.recv_message().await.unwrap()
+                {
+                    receiver.write_chunk(index, &data).await.unwrap();
+                }
+            }
+            // Abrupt carrier failure simulation
+            drop(session);
+        }
+    });
+
+    // Receiver on Path B: records the first chunk index received and counts total received chunks
+    let p_b_count = path_b_chunks_received.clone();
+    let p_b_first = path_b_first_chunk.clone();
+    let receiver_dir_spawn_b_clone = receiver_dir_spawn_b.clone();
+    let receiver_handle_b = tokio::spawn(async move {
+        let (mut conn, _) = listener_b.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_b).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, remote_id_spawn_b);
+
+        let msg = session.recv_message().await.unwrap();
+        if let FluxMessage::TransferRequest { metadata } = msg {
+            let mut receiver =
+                FileReceiver::try_resume(metadata.clone(), &receiver_dir_spawn_b_clone)
+                    .await
+                    .unwrap()
+                    .expect("Receiver on Path B should find partial state on disk");
+
+            let start_chunk = receiver.resume_from_chunk();
+            assert_eq!(start_chunk, fail_at_chunk);
+            p_b_first.store(start_chunk, Ordering::SeqCst);
+
+            session
+                .send_message(&FluxMessage::TransferResume {
+                    transfer_id: metadata.transfer_id,
+                    resume_from_chunk: start_chunk,
+                })
+                .await
+                .unwrap();
+
+            let remaining = metadata.total_chunks - start_chunk;
+            for _ in 0..remaining {
+                if let FluxMessage::TransferChunk { index, data, .. } =
+                    session.recv_message().await.unwrap()
+                {
+                    receiver.write_chunk(index, &data).await.unwrap();
+                    p_b_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            // Expect Complete
+            if let FluxMessage::TransferComplete { transfer_id } =
+                session.recv_message().await.unwrap()
+            {
+                assert_eq!(transfer_id, metadata.transfer_id);
+            }
+
+            let final_path = receiver.finalize().await.unwrap();
+            assert!(final_path.exists());
+
+            session
+                .send_message(&FluxMessage::TransferResult {
+                    transfer_id: metadata.transfer_id,
+                    success: true,
+                    message: "Completed after migration".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Collection handshake
+        let goodbye = session.recv_message().await.unwrap();
+        assert_eq!(goodbye, FluxMessage::Goodbye);
+        session.close().await.unwrap();
+    });
+
+    // Sender Setup
+    let sender_transport = Arc::new(TcpTransport::new());
+    let session_builder = SessionBuilder::new(sender_transport.as_ref(), local_peer_id.clone());
+    let initial_session = session_builder
+        .connect(&remote_peer_id, addr_path_a)
+        .await
+        .unwrap();
+
+    let mut carrier = TransferCarrier::new(
+        remote_peer_id.clone(),
+        path_a_id.clone(),
+        initial_session,
+        registry.clone(),
+        sender_transport.clone(),
+        local_peer_id.clone(),
+    );
+
+    let cancel = TransferCancellation::new();
+    let progress = TransferProgress::new();
+
+    // Execute transfer with carrier autonomous migration
+    let transfer_result =
+        TransferManager::send_file_with_carrier(&mut carrier, &file_path, &cancel, &progress).await;
+    assert!(transfer_result.is_ok());
+
+    receiver_handle_a.await.unwrap();
+    receiver_handle_b.await.unwrap();
+
+    // Verification Assertions
+    assert_eq!(carrier.current_path_id, path_b_id);
+    assert_eq!(carrier.migration_count, 1);
+    assert_eq!(carrier.state(), &MigrationState::Completed);
+
+    // Efficiency assertions:
+    // Path B should have started exactly at chunk 6 (not chunk 0!)
+    assert_eq!(path_b_first_chunk.load(Ordering::SeqCst), fail_at_chunk);
+    // Path B should have received exactly 10 chunks (16 - 6), NOT all 16!
+    assert_eq!(
+        path_b_chunks_received.load(Ordering::SeqCst),
+        total_chunks - fail_at_chunk
+    );
+
+    // Verify final file integrity
+    let dest_file = receiver_dir.path().join("chunk_efficient.bin");
+    assert!(dest_file.exists());
+    let dest_bytes = tokio::fs::read(&dest_file).await.unwrap();
+    assert_eq!(dest_bytes.len(), file_size);
+    assert_eq!(compute_hash(&dest_bytes), expected_hash);
+}
+
+#[tokio::test]
+async fn test_s38_e2e_multi_file_chunk_efficient_carrier_migration() {
+    use flux_core::path::metrics::PathMetrics;
+    use flux_core::path::{Path, PathRegistry, PathState, TransportKind};
+    use flux_core::session::SessionBuilder;
+    use flux_core::transfer::{
+        MigrationState, TransferCancellation, TransferCarrier, TransferPlan, TransferProgress,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    // 3 files:
+    // file_0: 128 KiB (2 chunks)
+    // file_1: 256 KiB (4 chunks) -> will fail after chunk 1 (2 chunks total transferred: 0 and 1)
+    // file_2: 128 KiB (2 chunks)
+    let file_0 = sender_dir.path().join("f0.bin");
+    let file_1 = sender_dir.path().join("f1.bin");
+    let file_2 = sender_dir.path().join("f2.bin");
+
+    let p0 = create_test_file(&file_0, 128 * 1024).await;
+    let p1 = create_test_file(&file_1, 256 * 1024).await;
+    let p2 = create_test_file(&file_2, 128 * 1024).await;
+
+    let h0 = compute_hash(&p0);
+    let h1 = compute_hash(&p1);
+    let h2 = compute_hash(&p2);
+
+    let plan = TransferPlan::from_paths(&[file_0, file_1, file_2]).unwrap();
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    // Setup Path A Listener
+    let transport_receiver_a = TcpTransport::new();
+    let mut listener_a = transport_receiver_a
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_a = listener_a.local_addr();
+    let remote_id_spawn_a = remote_peer_id.clone();
+    let receiver_dir_spawn_a = receiver_dir.path().to_path_buf();
+
+    // Setup Path B Listener
+    let transport_receiver_b = TcpTransport::new();
+    let mut listener_b = transport_receiver_b
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_b = listener_b.local_addr();
+    let remote_id_spawn_b = remote_peer_id.clone();
+    let receiver_dir_spawn_b = receiver_dir.path().to_path_buf();
+
+    // Setup PathRegistry
+    let registry = PathRegistry::new();
+    let mut path_a = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_path_a);
+    path_a.state = PathState::Available;
+    path_a.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(10)));
+    let path_a_id = path_a.id.clone();
+    registry.register_path(path_a);
+
+    let mut path_b = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_path_b);
+    path_b.state = PathState::Available;
+    path_b.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(20)));
+    let path_b_id = path_b.id.clone();
+    registry.register_path(path_b);
+
+    // Receiver on Path A: receives file 0 completely, then receives 2 chunks of file 1, then drops connection
+    let receiver_handle_a = tokio::spawn(async move {
+        let (mut conn, _) = listener_a.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_a).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, remote_id_spawn_a);
+
+        // Receive File 0
+        let msg0 = session.recv_message().await.unwrap();
+        if let FluxMessage::TransferRequest { metadata } = msg0 {
+            TransferManager::receive_transfer(&mut session, metadata, &receiver_dir_spawn_a)
+                .await
+                .unwrap();
+        }
+
+        // Receive File 1 partially (2 chunks) then drop
+        let msg1 = session.recv_message().await.unwrap();
+        if let FluxMessage::TransferRequest { metadata } = msg1 {
+            let mut receiver = FileReceiver::new(metadata.clone(), &receiver_dir_spawn_a)
+                .await
+                .unwrap();
+            session
+                .send_message(&FluxMessage::TransferAccept {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await
+                .unwrap();
+
+            for _ in 0..2 {
+                if let FluxMessage::TransferChunk { index, data, .. } =
+                    session.recv_message().await.unwrap()
+                {
+                    receiver.write_chunk(index, &data).await.unwrap();
+                }
+            }
+
+            // Connection drop
+            drop(session);
+        }
+    });
+
+    // Receiver on Path B: receives the remaining collection
+    let receiver_handle_b = tokio::spawn(async move {
+        let (mut conn, _) = listener_b.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_b).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, remote_id_spawn_b);
+        TransferManager::receive_collection(&mut session, &receiver_dir_spawn_b)
+            .await
+            .unwrap();
+        session.close().await.unwrap();
+    });
+
+    // Sender setup
+    let sender_transport = Arc::new(TcpTransport::new());
+    let session_builder = SessionBuilder::new(sender_transport.as_ref(), local_peer_id.clone());
+    let initial_session = session_builder
+        .connect(&remote_peer_id, addr_path_a)
+        .await
+        .unwrap();
+
+    let mut carrier = TransferCarrier::new(
+        remote_peer_id.clone(),
+        path_a_id.clone(),
+        initial_session,
+        registry.clone(),
+        sender_transport.clone(),
+        local_peer_id.clone(),
+    );
+
+    let cancel = TransferCancellation::new();
+    let progress = TransferProgress::new();
+
+    let res =
+        TransferManager::send_collection_with_carrier(&mut carrier, &plan, &cancel, &progress)
+            .await;
+    assert!(res.is_ok());
+
+    receiver_handle_a.await.unwrap();
+    receiver_handle_b.await.unwrap();
+
+    // Verify carrier completed migration
+    assert_eq!(carrier.current_path_id, path_b_id);
+    assert_eq!(carrier.migration_count, 1);
+    assert_eq!(carrier.state(), &MigrationState::Completed);
+
+    // Verify all 3 files exist and hashes match perfectly
+    let out0 = receiver_dir.path().join("f0.bin");
+    let out1 = receiver_dir.path().join("f1.bin");
+    let out2 = receiver_dir.path().join("f2.bin");
+
+    assert!(out0.exists());
+    assert!(out1.exists());
+    assert!(out2.exists());
+
+    let b0 = tokio::fs::read(&out0).await.unwrap();
+    let b1 = tokio::fs::read(&out1).await.unwrap();
+    let b2 = tokio::fs::read(&out2).await.unwrap();
+
+    assert_eq!(compute_hash(&b0), h0);
+    assert_eq!(compute_hash(&b1), h1);
+    assert_eq!(compute_hash(&b2), h2);
+}
+
+#[tokio::test]
+async fn test_s38_cancellation_during_migration_checkpoint() {
+    use flux_core::path::metrics::PathMetrics;
+    use flux_core::path::{Path, PathRegistry, PathState, TransportKind};
+    use flux_core::session::SessionBuilder;
+    use flux_core::transfer::{
+        TransferCancellation, TransferCarrier, TransferError, TransferProgress,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    let file_path = sender_dir.path().join("cancel_chunk.bin");
+    let payload = create_test_file(&file_path, 256 * 1024).await;
+    let _ = compute_hash(&payload);
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    // Setup Path A
+    let transport_receiver_a = TcpTransport::new();
+    let mut listener_a = transport_receiver_a
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_a = listener_a.local_addr();
+    let remote_id_spawn_a = remote_peer_id.clone();
+    let receiver_dir_spawn_a = receiver_dir.path().to_path_buf();
+
+    let registry = PathRegistry::new();
+    let mut path_a = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_path_a);
+    path_a.state = PathState::Available;
+    path_a.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(10)));
+    let path_a_id = path_a.id.clone();
+    registry.register_path(path_a);
+
+    let cancel = TransferCancellation::new();
+    let cancel_clone = cancel.clone();
+
+    // Receiver on Path A: receives 1 chunk, triggers cancellation token locally, then drops
+    let receiver_handle_a = tokio::spawn(async move {
+        let (mut conn, _) = listener_a.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_a).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, remote_id_spawn_a);
+        let first_msg = session.recv_message().await.unwrap();
+        if let FluxMessage::TransferRequest { metadata } = first_msg {
+            let mut receiver = FileReceiver::new(metadata.clone(), &receiver_dir_spawn_a)
+                .await
+                .unwrap();
+            session
+                .send_message(&FluxMessage::TransferAccept {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await
+                .unwrap();
+
+            if let FluxMessage::TransferChunk { index, data, .. } =
+                session.recv_message().await.unwrap()
+            {
+                receiver.write_chunk(index, &data).await.unwrap();
+                // Cancel sender midway
+                cancel_clone.cancel();
+            }
+        }
+    });
+
+    let sender_transport = Arc::new(TcpTransport::new());
+    let session_builder = SessionBuilder::new(sender_transport.as_ref(), local_peer_id.clone());
+    let initial_session = session_builder
+        .connect(&remote_peer_id, addr_path_a)
+        .await
+        .unwrap();
+
+    let mut carrier = TransferCarrier::new(
+        remote_peer_id.clone(),
+        path_a_id.clone(),
+        initial_session,
+        registry.clone(),
+        sender_transport.clone(),
+        local_peer_id.clone(),
+    );
+
+    let progress = TransferProgress::new();
+    let result =
+        TransferManager::send_file_with_carrier(&mut carrier, &file_path, &cancel, &progress).await;
+
+    assert!(matches!(result, Err(TransferError::Cancelled)));
+    receiver_handle_a.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_s38_failure_before_any_chunk_migrates_cleanly() {
+    use flux_core::path::metrics::PathMetrics;
+    use flux_core::path::{Path, PathRegistry, PathState, TransportKind};
+    use flux_core::session::SessionBuilder;
+    use flux_core::transfer::{
+        MigrationState, TransferCancellation, TransferCarrier, TransferProgress,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+
+    let file_path = sender_dir.path().join("zero_chunk_fail.bin");
+    let payload = create_test_file(&file_path, 128 * 1024).await;
+    let expected_hash = compute_hash(&payload);
+
+    let local_peer_id = PeerId::new();
+    let remote_peer_id = PeerId::new();
+
+    // Setup Path A (fails immediately after handshake, before accepting any chunk)
+    let transport_receiver_a = TcpTransport::new();
+    let mut listener_a = transport_receiver_a
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_a = listener_a.local_addr();
+    let remote_id_spawn_a = remote_peer_id.clone();
+
+    // Setup Path B
+    let transport_receiver_b = TcpTransport::new();
+    let mut listener_b = transport_receiver_b
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_path_b = listener_b.local_addr();
+    let remote_id_spawn_b = remote_peer_id.clone();
+    let receiver_dir_spawn_b = receiver_dir.path().to_path_buf();
+
+    let registry = PathRegistry::new();
+    let mut path_a = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_path_a);
+    path_a.state = PathState::Available;
+    path_a.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(10)));
+    let path_a_id = path_a.id.clone();
+    registry.register_path(path_a);
+
+    let mut path_b = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_path_b);
+    path_b.state = PathState::Available;
+    path_b.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(25)));
+    let path_b_id = path_b.id.clone();
+    registry.register_path(path_b);
+
+    // Receiver A: closes connection immediately upon TransferRequest
+    let receiver_handle_a = tokio::spawn(async move {
+        let (mut conn, _) = listener_a.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_a).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, remote_id_spawn_a);
+        let _ = session.recv_message().await;
+        // Drop before sending Accept/Chunks
+        drop(session);
+    });
+
+    // Receiver B: receives full transfer
+    let receiver_handle_b = tokio::spawn(async move {
+        let (mut conn, _) = listener_b.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_b).await.unwrap();
+        }
+        let mut session = Session::from_connection(conn, remote_id_spawn_b);
+        TransferManager::receive_collection(&mut session, &receiver_dir_spawn_b)
+            .await
+            .unwrap();
+        session.close().await.unwrap();
+    });
+
+    let sender_transport = Arc::new(TcpTransport::new());
+    let session_builder = SessionBuilder::new(sender_transport.as_ref(), local_peer_id.clone());
+    let initial_session = session_builder
+        .connect(&remote_peer_id, addr_path_a)
+        .await
+        .unwrap();
+
+    let mut carrier = TransferCarrier::new(
+        remote_peer_id.clone(),
+        path_a_id.clone(),
+        initial_session,
+        registry.clone(),
+        sender_transport.clone(),
+        local_peer_id.clone(),
+    );
+
+    let cancel = TransferCancellation::new();
+    let progress = TransferProgress::new();
+
+    let res =
+        TransferManager::send_file_with_carrier(&mut carrier, &file_path, &cancel, &progress).await;
+    assert!(res.is_ok());
+
+    receiver_handle_a.await.unwrap();
+    receiver_handle_b.await.unwrap();
+
+    assert_eq!(carrier.current_path_id, path_b_id);
+    assert_eq!(carrier.migration_count, 1);
+    assert_eq!(carrier.state(), &MigrationState::Completed);
+
+    let dest_file = receiver_dir.path().join("zero_chunk_fail.bin");
+    assert!(dest_file.exists());
+    let dest_bytes = tokio::fs::read(&dest_file).await.unwrap();
+    assert_eq!(compute_hash(&dest_bytes), expected_hash);
+}
