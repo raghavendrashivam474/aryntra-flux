@@ -11,7 +11,7 @@ pub mod receiver;
 
 pub use chunker::Chunker;
 pub use collection::{CollectionError, TransferItem, TransferPlan};
-pub use continuity::TransferContinuation;
+pub use continuity::{ChunkCheckpoint, TransferContinuation};
 pub use control::TransferCancellation;
 pub use error::{Result, TransferError};
 pub use manager::TransferManager;
