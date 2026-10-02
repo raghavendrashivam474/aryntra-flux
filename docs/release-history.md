@@ -24,7 +24,7 @@ This document provides the canonical map of sprint iterations, milestone objecti
 | **S3.4** | Transfer Observability | `v0.3.5` | `db2cea5` | Released |
 | **S3.5** | Path-Aware Transfer Continuity | `v0.3.6` | `788c109` | Released (Current Baseline) |
 | **S3.5.1**| Versioning & Release Hygiene | — | *Current HEAD* | Micro-Sprint (Docs only) |
-| **S3.6** | Path-Aware Transfer Migration | `v0.4.0` | *Upcoming* | Planned |
+| **S3.6** | Path-Aware Transfer Migration | `v0.16.0` | *Current HEAD* | Completed |
 
 ---
 

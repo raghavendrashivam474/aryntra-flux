@@ -12,6 +12,7 @@ Flux Core remains agnostic of the specific transport layer.
 4. **Transport Implementation**: QUIC, TCP, Bluetooth, etc.
 
 ## Transfer Subsystem (S1.4 + S1.5 + S1.6)
+
 ```text
 TransferPlan / TransferItem (S1.6 Collection Model)
 ↓
@@ -61,6 +62,44 @@ Flux models peer connectivity using an explicit multi-path abstraction layer:
    ┌───────────┐
    │ Transfer  │
    └───────────┘
+```
+
 Peer Identity vs Route Identity: PeerId tracks who the node is. PathId tracks a specific route (TransportKind + SocketAddr) to reach them.
 Path Registry: PathRegistry maintains thread-safe collections of candidate paths per peer, updated dynamically via discovery.
 Path States: Discovered -> Candidate -> Connecting -> Available / Unavailable.
+## Path-Aware Transfer Migration (S3.6)
+
+S3.6 establishes the formal separation of the durable **logical transfer operation** from the replaceable **physical communication route (carrier)**:
+
+```text
+               ┌──────────────────────┐
+               │    TransferManager   │
+               └──────────┬───────────┘
+                          │
+                  logical progress
+                          │
+                          ▼
+               ┌──────────────────────┐
+               │   TransferCarrier    │
+               └──────────┬───────────┘
+                          │
+             ┌────────────┴────────────┐
+             │                         │
+       current_path             replacement_path
+             │                         │
+             ▼                         ▼
+         Session A                 Session B
+             │                         │
+             ▼                         ▼
+          Path A                    Path B
+             │
+             X (carrier failure)
+```
+- **Transfer ≠ Path**: A transfer represents a high-level logical transaction (source files, destination directory, progress). The path and its associated session are merely temporary transport carriers.
+- **`TransferCarrier<T: Transport>`**: Orchestrates active session tracking, alternate path querying, and autonomous connection establishment.
+- **Autonomous Migration State Machine**:
+  - `Active`: Transmitting chunks over the active path.
+  - `Migrating`: Active path failed; registry updated to `Unavailable`, session shut down, `PathSelector` queried, and connection to a replacement path initiated.
+  - `Paused`: No backup paths available; logical checkpoint safely preserved.
+  - `Completed`: Complete collection transferred and verified.
+- **Resumption Semantics**: Resumes using the receiver's existing `TransferResume` sidecar checkpoints. Progress is calculated from the last fully completed file, and the chunk-level resume completes the file transmission.
