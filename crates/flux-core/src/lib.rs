@@ -1,4 +1,4 @@
-pub mod discovery;
+﻿pub mod discovery;
 pub mod identity;
 pub mod node;
 pub mod peer;
@@ -19,9 +19,9 @@ pub use protocol::{FluxMessage, PROTOCOL_VERSION};
 pub mod session;
 pub use session::{Session, SessionBuilder, SessionState};
 
-// S1.4: File transfer
+// S1.4 & S3.6: File transfer & path migration
 pub mod transfer;
 pub use transfer::{
-    CollectionError, TransferCancellation, TransferId, TransferItem, TransferManager,
-    TransferMetadata, TransferPlan, TransferProgress,
+    CollectionError, MigrationState, TransferCancellation, TransferCarrier, TransferId,
+    TransferItem, TransferManager, TransferMetadata, TransferPlan, TransferProgress,
 };

@@ -1,13 +1,15 @@
-﻿use super::chunker::Chunker;
+use super::chunker::Chunker;
 use super::collection::TransferPlan;
 use super::continuity::TransferContinuation;
 use super::control::TransferCancellation;
 use super::error::{Result, TransferError};
 use super::metadata::TransferMetadata;
+use super::migration::{MigrationState, TransferCarrier};
 use super::progress::TransferProgress;
 use super::receiver::FileReceiver;
 use crate::protocol::FluxMessage;
 use crate::session::Session;
+use crate::transport::Transport;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio::io::AsyncReadExt;
@@ -642,6 +644,108 @@ impl TransferManager {
 
         println!("\nCollection continuation complete. Sending termination handshake...");
         session.send_message(&FluxMessage::Goodbye).await?;
+        Ok(())
+    }
+    /// Send a single file over a path-aware carrier with autonomous migration support.
+    pub async fn send_file_with_carrier<T: Transport>(
+        carrier: &mut TransferCarrier<T>,
+        file_path: &Path,
+        cancel: &TransferCancellation,
+        progress: &TransferProgress,
+    ) -> Result<()> {
+        let plan = TransferPlan::from_paths(std::slice::from_ref(&file_path.to_path_buf()))
+            .map_err(|e| TransferError::UnexpectedMessage(e.to_string()))?;
+        Self::send_collection_with_carrier(carrier, &plan, cancel, progress).await
+    }
+
+    /// Orchestrate sending a complete collection over a path-aware carrier with autonomous migration.
+    ///
+    /// If the active session/path fails during transfer, the carrier automatically selects
+    /// the next best healthy candidate path via `PathSelector`, establishes a replacement session,
+    /// and resumes the transfer from the last verified checkpoint without losing completed progress.
+    pub async fn send_collection_with_carrier<T: Transport>(
+        carrier: &mut TransferCarrier<T>,
+        plan: &TransferPlan,
+        cancel: &TransferCancellation,
+        progress: &TransferProgress,
+    ) -> Result<()> {
+        let total = plan.items.len();
+        println!(
+            "Starting path-aware transfer of collection ({} items) on path {}...",
+            total, carrier.current_path_id
+        );
+
+        let mut current_idx = progress.files_completed();
+
+        while current_idx < total {
+            if cancel.is_cancelled() {
+                println!(
+                    "\nCollection transfer cancelled before sending item {}",
+                    current_idx + 1
+                );
+                return Err(TransferError::Cancelled);
+            }
+
+            let item = &plan.items[current_idx];
+            println!("\n[{}/{}] Sending file...", current_idx + 1, total);
+            let relative_str = item.relative_path.to_string_lossy().to_string();
+
+            match Self::send_file_internal(
+                &mut carrier.session,
+                &item.source_path,
+                Some(relative_str),
+                cancel,
+                progress,
+            )
+            .await
+            {
+                Ok(()) => {
+                    // File completed successfully
+                    progress.add_file();
+                    current_idx += 1;
+                }
+                Err(TransferError::Cancelled) => {
+                    return Err(TransferError::Cancelled);
+                }
+                Err(TransferError::Transport(e)) => {
+                    eprintln!(
+                        "\n[CARRIER FAILURE] Transport error while transferring item {} ({}): {}",
+                        current_idx + 1,
+                        item.source_path.display(),
+                        e
+                    );
+
+                    // Calibrate progress tracker to the verified baseline of completed files
+                    let mut completed_bytes = 0u64;
+                    for completed_item in &plan.items[..current_idx] {
+                        if let Ok(meta) = tokio::fs::metadata(&completed_item.source_path).await {
+                            completed_bytes += meta.len();
+                        }
+                    }
+                    progress.set_bytes(completed_bytes);
+                    progress.set_files(current_idx);
+
+                    // Trigger autonomous migration to alternate path
+                    carrier.migrate().await?;
+
+                    println!(
+                        "[MIGRATION RESUME] Migrated to path {}. Resuming transfer from item {}...",
+                        carrier.current_path_id,
+                        current_idx + 1
+                    );
+                    // Loop will retry current_idx with the newly established carrier session
+                }
+                Err(e) => {
+                    eprintln!("\nError sending item {}: {}", item.source_path.display(), e);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Send collection completion signal over the active session
+        println!("\nCollection transfer complete. Sending termination handshake...");
+        carrier.session.send_message(&FluxMessage::Goodbye).await?;
+        carrier.state = MigrationState::Completed;
         Ok(())
     }
 }
