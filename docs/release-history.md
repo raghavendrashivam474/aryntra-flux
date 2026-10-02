@@ -26,6 +26,8 @@ This document provides the canonical map of sprint iterations, milestone objecti
 | **S3.5.1**| Versioning & Release Hygiene | — | *Current HEAD* | Micro-Sprint (Docs only) |
 | **S3.6** | Path-Aware Transfer Migration | `v0.16.0` | `b2c20c2` | Released |
 | **S3.7** | Gateway-Aware Autonomous Transfer | `v0.17.0` | *Current HEAD* | Completed (Current Baseline) |
+| **S3.8** | Sender-Side Chunk Checkpointing & Efficient Migration | 0.18.0 | d688252 | Released |
+| **S3.9** | Cascading Path Migration & Multi-Fallback Transfer Recovery | 0.19.0 | *Target HEAD* | Completed (Current Baseline) |
 
 ---
 
@@ -43,3 +45,4 @@ The repository reflects three evolutionary tagging phases:
 ## 3. History Preservation Principle
 
 Historical tags and commits remain immutable. No historical tags will be renamed, deleted, or backfilled.
+

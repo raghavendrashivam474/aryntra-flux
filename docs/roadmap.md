@@ -21,4 +21,7 @@
 - [x] S3.5: Path-Aware Transfer Continuity
 - [x] S3.6: Path-Aware Autonomous Transfer Migration
 - [x] S3.7: Gateway-Aware Autonomous Transfer
-- [ ] S3.8: High-Bandwidth Multipath Concurrent Transport
+- [x] S3.8: Sender-Side Chunk Checkpointing & Efficient Transfer Migration (v0.18.0)
+- [x] S3.9: Cascading Path Migration & Multi-Fallback Transfer Recovery (v0.19.0)
+- [ ] S3.10: Dynamic Path Re-evaluation & Multi-Path Concurrent Transport
+
