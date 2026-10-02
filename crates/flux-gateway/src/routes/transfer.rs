@@ -1,4 +1,4 @@
-﻿use crate::error::{GatewayError, GatewayResult};
+use crate::error::{GatewayError, GatewayResult};
 use crate::state::GatewayState;
 use crate::transfer_tracker::GatewayTransferInfo;
 use axum::{
@@ -6,11 +6,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use flux_core::identity::PeerId;
+use flux_core::path::PathId;
 use flux_core::session::Session;
 use flux_core::transfer::{
-    TransferCancellation, TransferError, TransferManager, TransferPlan, TransferProgress,
+    TransferCancellation, TransferCarrier, TransferError, TransferManager, TransferPlan,
+    TransferProgress,
 };
+use flux_core::transport::TcpTransport;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -42,15 +47,19 @@ pub fn routes() -> Router<GatewayState> {
 
 /// Guard to guarantee the Session is returned back to the active sessions map
 /// even if the transfer task is completed, failed, panicked, or cancelled.
-struct SessionReturnGuard {
+///
+/// S3.7: Wraps a TransferCarrier instead of a raw Session so that after
+/// autonomous migration the *current* (possibly replacement) session is returned.
+struct CarrierReturnGuard {
     peer_id: String,
-    session: Option<Session>,
-    sessions_map: Arc<Mutex<std::collections::HashMap<String, Session>>>,
+    carrier: Option<TransferCarrier<TcpTransport>>,
+    sessions_map: Arc<Mutex<HashMap<String, Session>>>,
 }
 
-impl Drop for SessionReturnGuard {
+impl Drop for CarrierReturnGuard {
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
+        if let Some(carrier) = self.carrier.take() {
+            let session = carrier.session;
             let peer_id = self.peer_id.clone();
             let sessions_map = self.sessions_map.clone();
             tokio::spawn(async move {
@@ -73,16 +82,35 @@ async fn start_transfer(
             payload.peer_id
         ))
     })?;
-    drop(sessions_guard); // Release map lock immediately
+    drop(sessions_guard);
 
-    // 2. Resolve paths on disk and build TransferPlan
+    // 2. Resolve the target PeerId for path registry lookup
+    let target_uuid = uuid::Uuid::parse_str(&payload.peer_id)
+        .map_err(|e| GatewayError::InvalidRequest(format!("Invalid UUID: {}", e)))?;
+    let target_peer_id: PeerId = serde_json::from_str(&format!("\"{}\"", target_uuid))
+        .map_err(|e| GatewayError::Internal(format!("Failed to reconstruct PeerId: {}", e)))?;
+
+    // 3. Determine the PathId for the current session by matching remote address
+    let session_addr = session.remote_addr();
+    let current_path_id = state
+        .node
+        .path_registry
+        .get_paths(&target_peer_id)
+        .and_then(|paths| {
+            paths
+                .list()
+                .iter()
+                .find(|p| p.remote_addr == session_addr)
+                .map(|p| p.id.clone())
+        })
+        .unwrap_or_else(PathId::new);
+
+    // 4. Resolve paths on disk and build TransferPlan
     let paths: Vec<PathBuf> = payload.file_paths.iter().map(PathBuf::from).collect();
     let plan = TransferPlan::from_paths(&paths).map_err(|e| {
         GatewayError::InvalidRequest(format!("Failed to build transfer plan: {:?}", e))
     })?;
-
     if plan.is_empty() {
-        // Return session back before returning error
         let mut sg = state.sessions.lock().await;
         sg.insert(payload.peer_id.clone(), session);
         return Err(GatewayError::InvalidRequest(
@@ -90,38 +118,45 @@ async fn start_transfer(
         ));
     }
 
-    // 3. Compute total size for progress tracking
+    // 5. Compute total size for progress tracking
     let mut total_bytes = 0u64;
     for item in &plan.items {
         if let Ok(meta) = tokio::fs::metadata(&item.source_path).await {
             total_bytes += meta.len();
         }
     }
-
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let total_files = plan.len();
     let cancel_token = TransferCancellation::new();
     let progress = TransferProgress::new();
 
-    // 4. Initialize return guard for the task
-    let mut guard = SessionReturnGuard {
+    // 6. Construct TransferCarrier — wraps session with autonomous migration
+    let carrier = TransferCarrier::new(
+        target_peer_id,
+        current_path_id,
+        session,
+        state.node.path_registry.clone(),
+        state.transport.clone(),
+        state.node.identity.clone(),
+    );
+
+    // 7. Initialize return guard for the carrier
+    let mut guard = CarrierReturnGuard {
         peer_id: payload.peer_id.clone(),
-        session: None,
+        carrier: None,
         sessions_map: state.sessions.clone(),
     };
-
     let tracker_clone = state.tracker.clone();
     let transfer_id_clone = transfer_id.clone();
     let cancel_clone = cancel_token.clone();
     let progress_clone = progress.clone();
 
-    // 5. Spawn background Transfer Execution Task with cooperative cancellation and progress tracking
+    // 8. Spawn background task using carrier-aware transfer (S3.7 integration)
     let task_handle = tokio::spawn(async move {
-        guard.session = Some(session);
-
-        let session_ref = guard.session.as_mut().unwrap();
-        match TransferManager::send_collection_with_cancel_and_progress(
-            session_ref,
+        guard.carrier = Some(carrier);
+        let carrier_ref = guard.carrier.as_mut().unwrap();
+        match TransferManager::send_collection_with_carrier(
+            carrier_ref,
             &plan,
             &cancel_clone,
             &progress_clone,
@@ -145,7 +180,7 @@ async fn start_transfer(
         }
     });
 
-    // 6. Register running transfer in Tracker with cooperative token and progress tracker
+    // 9. Register running transfer in Tracker
     state
         .tracker
         .register(
