@@ -435,3 +435,290 @@ async fn test_gateway_transfer_continuity_across_session_replacement() {
     assert_eq!(body["bytes_transferred"], 10_000_000);
     assert_eq!(body["files_transferred"], 3);
 }
+
+// ── S3.7: Gateway-Aware Autonomous Migration Tests ──
+
+#[tokio::test]
+async fn test_gateway_e2e_transfer_with_path_migration() {
+    use flux_core::identity::PeerId;
+    use flux_core::path::metrics::PathMetrics;
+    use flux_core::path::{Path, PathState, TransportKind};
+    use flux_core::protocol::FluxMessage;
+    use flux_core::session::SessionBuilder;
+    use flux_core::transfer::FileReceiver;
+    use flux_core::transport::tcp::{TcpConnection, TcpTransport};
+    use flux_core::transport::Transport;
+    use sha2::{Digest, Sha256};
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    let (url, node, state) = spawn_test_gateway().await;
+    let client = reqwest::Client::new();
+
+    // Prepare temporary directories and payload
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+    let file_path = sender_dir.path().join("gateway_migrated.bin");
+    let payload_size = 200 * 1024; // 200 KiB (~4 chunks)
+    let payload: Vec<u8> = (0..payload_size).map(|i| (i % 256) as u8).collect();
+    tokio::fs::write(&file_path, &payload).await.unwrap();
+
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let expected_hash: [u8; 32] = hasher.finalize().into();
+
+    // Setup receiver mock paths
+    let remote_peer_id = PeerId::new();
+    let transport_receiver = Arc::new(TcpTransport::new());
+
+    let mut listener_a = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_a = listener_a.local_addr();
+
+    let mut listener_b = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr_b = listener_b.local_addr();
+
+    // Register paths in Gateway node PathRegistry
+    let mut path_a = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_a);
+    path_a.state = PathState::Available;
+    path_a.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(50)));
+    let path_a_id = path_a.id.clone();
+    node.path_registry.register_path(path_a);
+
+    let mut path_b = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr_b);
+    path_b.state = PathState::Available;
+    path_b.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(10)));
+    let path_b_id = path_b.id.clone();
+    node.path_registry.register_path(path_b);
+
+    let remote_id_spawn_a = remote_peer_id.clone();
+    let receiver_out_a = receiver_dir.path().to_path_buf();
+    let receiver_handle_a = tokio::spawn(async move {
+        let (mut conn, _) = listener_a.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_a).await.unwrap();
+        }
+        let mut session =
+            flux_core::session::Session::from_connection(conn, remote_id_spawn_a.clone());
+
+        // Process request and 1 chunk, then abruptly disconnect
+        if let Ok(FluxMessage::TransferRequest { metadata }) = session.recv_message().await {
+            session
+                .send_message(&FluxMessage::TransferAccept {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await
+                .unwrap();
+            let mut receiver = FileReceiver::new(metadata, &receiver_out_a).await.unwrap();
+            if let Ok(FluxMessage::TransferChunk { index, data, .. }) = session.recv_message().await
+            {
+                receiver.write_chunk(index, &data).await.unwrap();
+            }
+        }
+        // Connection drops here simulating failure
+        drop(session);
+    });
+
+    let remote_id_spawn_b = remote_peer_id.clone();
+    let receiver_out_b = receiver_dir.path().to_path_buf();
+    let receiver_handle_b = tokio::spawn(async move {
+        let (mut conn, _) = listener_b.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn_b).await.unwrap();
+        }
+        let mut session =
+            flux_core::session::Session::from_connection(conn, remote_id_spawn_b.clone());
+        flux_core::transfer::TransferManager::receive_collection(&mut session, &receiver_out_b)
+            .await
+            .unwrap();
+    });
+
+    // Establish initial session on Path A and place into Gateway State
+    let session_builder = SessionBuilder::new(state.transport.as_ref(), node.identity.clone());
+    let session_a = session_builder
+        .connect(&remote_peer_id, addr_a)
+        .await
+        .unwrap();
+
+    {
+        let mut sessions_guard = state.sessions.lock().await;
+        sessions_guard.insert(remote_peer_id.to_string(), session_a);
+    }
+
+    // Trigger transfer via HTTP Gateway endpoint
+    let res = client
+        .post(format!("{}/flux/v1/transfer", url))
+        .json(&json!({
+            "peer_id": remote_peer_id.to_string(),
+            "file_paths": [file_path.to_str().unwrap()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let transfer_id = body["transfer_id"].as_str().unwrap().to_string();
+    assert_eq!(body["status"], "RUNNING");
+
+    // Wait for the transfer to complete autonomously across migration
+    let mut completed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status_res = client
+            .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+            .send()
+            .await
+            .unwrap();
+        let status_body: serde_json::Value = status_res.json().await.unwrap();
+        if status_body["status"] == "COMPLETED" {
+            completed = true;
+            assert_eq!(status_body["bytes_transferred"], payload_size as u64);
+            assert_eq!(status_body["files_transferred"], 1);
+            break;
+        } else if status_body["status"] == "FAILED" {
+            panic!(
+                "Transfer unexpectedly failed: {:?}",
+                status_body["error_message"]
+            );
+        }
+    }
+
+    assert!(completed, "Gateway transfer must reach COMPLETED status");
+
+    let _ = receiver_handle_a.await;
+    let _ = receiver_handle_b.await;
+
+    // Verify received file on disk
+    let final_file = receiver_dir.path().join("gateway_migrated.bin");
+    assert!(final_file.exists());
+    let received_data = tokio::fs::read(&final_file).await.unwrap();
+    assert_eq!(received_data, payload);
+
+    let mut final_hasher = Sha256::new();
+    final_hasher.update(&received_data);
+    let final_hash: [u8; 32] = final_hasher.finalize().into();
+    assert_eq!(final_hash, expected_hash);
+
+    // Verify Path A is marked unavailable and Path B is active
+    let paths = node.path_registry.get_paths(&remote_peer_id).unwrap();
+    assert_eq!(paths.get(&path_a_id).unwrap().state, PathState::Unavailable);
+    assert_eq!(paths.get(&path_b_id).unwrap().state, PathState::Available);
+}
+
+#[tokio::test]
+async fn test_gateway_e2e_transfer_no_alternate_path() {
+    use flux_core::identity::PeerId;
+    use flux_core::path::metrics::PathMetrics;
+    use flux_core::path::{Path, PathState, TransportKind};
+    use flux_core::protocol::FluxMessage;
+    use flux_core::session::SessionBuilder;
+    use flux_core::transfer::FileReceiver;
+    use flux_core::transport::tcp::{TcpConnection, TcpTransport};
+    use flux_core::transport::Transport;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    let (url, node, state) = spawn_test_gateway().await;
+    let client = reqwest::Client::new();
+
+    let sender_dir = tempdir().unwrap();
+    let receiver_dir = tempdir().unwrap();
+    let file_path = sender_dir.path().join("no_alt.bin");
+    let payload_size = 150 * 1024;
+    let payload: Vec<u8> = (0..payload_size).map(|i| (i % 256) as u8).collect();
+    tokio::fs::write(&file_path, &payload).await.unwrap();
+
+    let remote_peer_id = PeerId::new();
+    let transport_receiver = Arc::new(TcpTransport::new());
+
+    let mut listener = transport_receiver
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr();
+
+    // Register ONLY one single path with no alternate
+    let mut path = Path::new(remote_peer_id.clone(), TransportKind::Tcp, addr);
+    path.state = PathState::Available;
+    path.metrics = Some(PathMetrics::with_rtt(Duration::from_millis(50)));
+    node.path_registry.register_path(path);
+
+    let remote_id_spawn = remote_peer_id.clone();
+    let receiver_out = receiver_dir.path().to_path_buf();
+    let receiver_handle = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        if let Some(tcp_conn) = conn.as_any_mut().downcast_mut::<TcpConnection>() {
+            tcp_conn.server_handshake(&remote_id_spawn).await.unwrap();
+        }
+        let mut session =
+            flux_core::session::Session::from_connection(conn, remote_id_spawn.clone());
+
+        if let Ok(FluxMessage::TransferRequest { metadata }) = session.recv_message().await {
+            session
+                .send_message(&FluxMessage::TransferAccept {
+                    transfer_id: metadata.transfer_id,
+                })
+                .await
+                .unwrap();
+            let mut receiver = FileReceiver::new(metadata, &receiver_out).await.unwrap();
+            if let Ok(FluxMessage::TransferChunk { index, data, .. }) = session.recv_message().await
+            {
+                receiver.write_chunk(index, &data).await.unwrap();
+            }
+        }
+        // Disconnect immediately
+        drop(session);
+    });
+
+    let session_builder = SessionBuilder::new(state.transport.as_ref(), node.identity.clone());
+    let session = session_builder
+        .connect(&remote_peer_id, addr)
+        .await
+        .unwrap();
+
+    {
+        let mut sessions_guard = state.sessions.lock().await;
+        sessions_guard.insert(remote_peer_id.to_string(), session);
+    }
+
+    let res = client
+        .post(format!("{}/flux/v1/transfer", url))
+        .json(&json!({
+            "peer_id": remote_peer_id.to_string(),
+            "file_paths": [file_path.to_str().unwrap()]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    let transfer_id = body["transfer_id"].as_str().unwrap().to_string();
+
+    let mut failed = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status_res = client
+            .get(format!("{}/flux/v1/transfer/{}", url, transfer_id))
+            .send()
+            .await
+            .unwrap();
+        let status_body: serde_json::Value = status_res.json().await.unwrap();
+        if status_body["status"] == "FAILED" {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(
+        failed,
+        "Gateway transfer must fail when no alternate path exists"
+    );
+    let _ = receiver_handle.await;
+}
