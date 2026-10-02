@@ -1,4 +1,6 @@
-﻿# ADR-0019: Cascading Path Migration & Multi-Fallback Transfer Recovery
+﻿# ADR-0017: Cascading Path Migration & Multi-Fallback Transfer Recovery
+
+*Historical Note: Originally designated ADR-0019; chronologically normalized to ADR-0017 following S3.6–S3.8 architecture audit.*
 
 ## Context
 In Flux v0.18.0, when a transport failure is detected during an active transfer, the TransferCarrier attempts to migrate once. 
@@ -20,3 +22,4 @@ We will modify the internal implementation of TransferCarrier::migrate() in crat
 - Multiple sequential failures during active transfer and connection setup are handled transparently inside the carrier.
 - All S3.8 chunk checkpointing guarantees remain perfectly preserved because the same transfer progress/checkpoints are maintained.
 - All existing tests in the workspace must continue to compile and pass without regressions.
+

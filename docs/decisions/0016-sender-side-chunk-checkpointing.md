@@ -1,4 +1,6 @@
-﻿# ADR 0018: Sender-Side Chunk Checkpointing & Efficient Migration
+﻿# ADR-0016: Sender-Side Chunk Checkpointing & Efficient Migration
+
+*Historical Note: Originally designated ADR-0018; chronologically normalized to ADR-0016 following S3.6–S3.8 architecture audit.*
 
 ## Context
 Prior to Sprint S3.8, carrier migration (introduced in S3.6 and integrated with the Gateway in S3.7) was file-level on the sender side. When a transport failure occurred mid-file, the sender-side `Chunker` was dropped. Upon migration, the transfer would resume starting from the beginning of the interrupted file, relying on the receiver to discard duplicate bytes. While correct, this re-read, re-hashed, and re-sent bytes over the network unnecessarily, reducing migration efficiency.
@@ -21,3 +23,4 @@ We introduce a lightweight, precise `ChunkCheckpoint` state model inside `contin
 - **Correctness**: Preserved. SHA-256 remains authoritative and matches byte-for-byte.
 - **Efficiency**: Already completed chunks are never re-transmitted or re-read from disk.
 - **Simplicity**: No changes to the wire protocol or Gateway are required. No competing state machines.
+
