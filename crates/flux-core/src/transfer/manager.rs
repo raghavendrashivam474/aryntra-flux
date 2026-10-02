@@ -1,6 +1,6 @@
-use super::chunker::Chunker;
+﻿use super::chunker::Chunker;
 use super::collection::TransferPlan;
-use super::continuity::TransferContinuation;
+use super::continuity::{ChunkCheckpoint, TransferContinuation};
 use super::control::TransferCancellation;
 use super::error::{Result, TransferError};
 use super::metadata::TransferMetadata;
@@ -44,7 +44,7 @@ impl TransferManager {
         cancel: &TransferCancellation,
     ) -> Result<()> {
         let progress = TransferProgress::new();
-        Self::send_file_internal(session, file_path, None, cancel, &progress).await
+        Self::send_file_internal(session, file_path, None, cancel, &progress, None).await
     }
 
     /// Send a single file over an established session with cancellation and progress reporting.
@@ -54,16 +54,18 @@ impl TransferManager {
         cancel: &TransferCancellation,
         progress: &TransferProgress,
     ) -> Result<()> {
-        Self::send_file_internal(session, file_path, None, cancel, progress).await
+        Self::send_file_internal(session, file_path, None, cancel, progress, None).await
     }
 
-    /// Internal implementation of single-file sending supporting optional relative paths, cancellation, and progress.
+    /// Internal implementation of single-file sending supporting optional relative paths, cancellation,
+    /// progress reporting, and optional sender-side chunk checkpoint tracking.
     async fn send_file_internal(
         session: &mut Session,
         file_path: &Path,
         relative_path: Option<String>,
         cancel: &TransferCancellation,
         progress: &TransferProgress,
+        mut checkpoint: Option<&mut ChunkCheckpoint>,
     ) -> Result<()> {
         if cancel.is_cancelled() {
             return Err(TransferError::Cancelled);
@@ -74,11 +76,9 @@ impl TransferManager {
             .ok_or_else(|| TransferError::InvalidFilename("no filename".to_string()))?
             .to_string_lossy()
             .to_string();
-
         let file_size = tokio::fs::metadata(file_path).await?.len();
         let sha256 = Self::hash_file(file_path).await?;
         let mut metadata = TransferMetadata::new(file_name, file_size, sha256);
-
         if let Some(rel) = relative_path {
             metadata = metadata.with_relative_path(rel);
         }
@@ -128,6 +128,11 @@ impl TransferManager {
                 let resumed_bytes = (resume_from_chunk as u64) * (metadata.chunk_size as u64);
                 let actual_resumed_bytes = resumed_bytes.min(metadata.file_size);
                 progress.add_bytes(actual_resumed_bytes);
+                if let Some(ref mut cp) = checkpoint {
+                    cp.completed_chunks = resume_from_chunk;
+                    cp.next_chunk = resume_from_chunk;
+                    cp.bytes_completed = actual_resumed_bytes;
+                }
                 resume_from_chunk
             }
             FluxMessage::TransferReject { reason, .. } => {
@@ -169,7 +174,6 @@ impl TransferManager {
             }
 
             let chunk_len = data.len() as u64;
-
             session
                 .send_message(&FluxMessage::TransferChunk {
                     transfer_id: metadata.transfer_id,
@@ -178,8 +182,11 @@ impl TransferManager {
                 })
                 .await?;
 
-            // Record progress immediately upon successful transmission
+            // Record progress and update sender-side checkpoint upon successful transmission
             progress.add_bytes(chunk_len);
+            if let Some(ref mut cp) = checkpoint {
+                cp.record_chunk(index, chunk_len);
+            }
 
             let (cur, tot) = chunker.progress();
             print!(
@@ -279,13 +286,13 @@ impl TransferManager {
 
             println!("\n[{}/{}] Sending file...", idx + 1, total);
             let relative_str = item.relative_path.to_string_lossy().to_string();
-
             if let Err(e) = Self::send_file_internal(
                 session,
                 &item.source_path,
                 Some(relative_str),
                 cancel,
                 progress,
+                None,
             )
             .await
             {
@@ -357,7 +364,6 @@ impl TransferManager {
                     let bytes_already = (from as u64) * (metadata.chunk_size as u64);
                     let actual_bytes_already = bytes_already.min(metadata.file_size);
                     progress.add_bytes(actual_bytes_already);
-
                     println!("    Resuming from chunk {}/{}", from, metadata.total_chunks);
                     session
                         .send_message(&FluxMessage::TransferResume {
@@ -406,7 +412,6 @@ impl TransferManager {
                     let chunk_len = data.len() as u64;
                     receiver.write_chunk(index, &data).await?;
                     progress.add_bytes(chunk_len);
-
                     let (cur, tot) = receiver.progress();
                     print!("\r    Receiving: chunk {}/{}", cur, tot);
                 }
@@ -576,6 +581,7 @@ impl TransferManager {
         }
         Ok(())
     }
+
     /// Continue an interrupted collection transfer on a new session.
     ///
     /// Skips files that were already fully completed and resumes the first
@@ -621,13 +627,13 @@ impl TransferManager {
 
             println!("\n[{}/{}] Continuing file...", idx + 1, total);
             let relative_str = item.relative_path.to_string_lossy().to_string();
-
             if let Err(e) = Self::send_file_internal(
                 session,
                 &item.source_path,
                 Some(relative_str),
                 &continuation.cancel,
                 &continuation.progress,
+                None,
             )
             .await
             {
@@ -646,6 +652,7 @@ impl TransferManager {
         session.send_message(&FluxMessage::Goodbye).await?;
         Ok(())
     }
+
     /// Send a single file over a path-aware carrier with autonomous migration support.
     pub async fn send_file_with_carrier<T: Transport>(
         carrier: &mut TransferCarrier<T>,
@@ -662,7 +669,7 @@ impl TransferManager {
     ///
     /// If the active session/path fails during transfer, the carrier automatically selects
     /// the next best healthy candidate path via `PathSelector`, establishes a replacement session,
-    /// and resumes the transfer from the last verified checkpoint without losing completed progress.
+    /// and resumes the transfer from the last verified chunk checkpoint without losing completed progress.
     pub async fn send_collection_with_carrier<T: Transport>(
         carrier: &mut TransferCarrier<T>,
         plan: &TransferPlan,
@@ -676,6 +683,7 @@ impl TransferManager {
         );
 
         let mut current_idx = progress.files_completed();
+        let mut checkpoint = ChunkCheckpoint::new(current_idx);
 
         while current_idx < total {
             if cancel.is_cancelled() {
@@ -696,6 +704,7 @@ impl TransferManager {
                 Some(relative_str),
                 cancel,
                 progress,
+                Some(&mut checkpoint),
             )
             .await
             {
@@ -703,17 +712,24 @@ impl TransferManager {
                     // File completed successfully
                     progress.add_file();
                     current_idx += 1;
+                    checkpoint = ChunkCheckpoint::new(current_idx);
                 }
                 Err(TransferError::Cancelled) => {
                     return Err(TransferError::Cancelled);
                 }
                 Err(TransferError::Transport(e)) => {
                     eprintln!(
-                        "\n[CARRIER FAILURE] Transport error while transferring item {} ({}): {}",
+                        "\n[CARRIER FAILURE] Transport error while transferring item {} ({}) at chunk {}: {}",
                         current_idx + 1,
                         item.source_path.display(),
+                        checkpoint.completed_chunks,
                         e
                     );
+
+                    // Cooperative cancellation check must be prioritized before attempting migration!
+                    if cancel.is_cancelled() {
+                        return Err(TransferError::Cancelled);
+                    }
 
                     // Calibrate progress tracker to the verified baseline of completed files
                     let mut completed_bytes = 0u64;
@@ -729,11 +745,13 @@ impl TransferManager {
                     carrier.migrate().await?;
 
                     println!(
-                        "[MIGRATION RESUME] Migrated to path {}. Resuming transfer from item {}...",
+                        "[MIGRATION RESUME] Migrated to path {}. Resuming item {} from verified chunk checkpoint {}...",
                         carrier.current_path_id,
-                        current_idx + 1
+                        current_idx + 1,
+                        checkpoint.next_chunk
                     );
-                    // Loop will retry current_idx with the newly established carrier session
+                    // Loop will retry current_idx with the newly established carrier session,
+                    // and FileReceiver::try_resume will seamlessly resume from the exact chunk offset!
                 }
                 Err(e) => {
                     eprintln!("\nError sending item {}: {}", item.source_path.display(), e);
