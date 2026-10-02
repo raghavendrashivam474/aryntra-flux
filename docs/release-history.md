@@ -22,9 +22,10 @@ This document provides the canonical map of sprint iterations, milestone objecti
 | **S3.2+**| Gateway Runtime Hardening | `v0.3.3` | `85f8899` | Released |
 | **S3.3** | Reliable Transfer Control | `v0.3.4` | `d6706a1` | Released |
 | **S3.4** | Transfer Observability | `v0.3.5` | `db2cea5` | Released |
-| **S3.5** | Path-Aware Transfer Continuity | `v0.3.6` | `788c109` | Released (Current Baseline) |
+| **S3.5** | Path-Aware Transfer Continuity | `v0.3.6` | `788c109` | Released |
 | **S3.5.1**| Versioning & Release Hygiene | — | *Current HEAD* | Micro-Sprint (Docs only) |
-| **S3.6** | Path-Aware Transfer Migration | `v0.16.0` | *Current HEAD* | Completed |
+| **S3.6** | Path-Aware Transfer Migration | `v0.16.0` | `b2c20c2` | Released |
+| **S3.7** | Gateway-Aware Autonomous Transfer | `v0.17.0` | *Current HEAD* | Completed (Current Baseline) |
 
 ---
 

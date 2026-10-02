@@ -103,3 +103,58 @@ S3.6 establishes the formal separation of the durable **logical transfer operati
   - `Paused`: No backup paths available; logical checkpoint safely preserved.
   - `Completed`: Complete collection transferred and verified.
 - **Resumption Semantics**: Resumes using the receiver's existing `TransferResume` sidecar checkpoints. Progress is calculated from the last fully completed file, and the chunk-level resume completes the file transmission.
+
+## Gateway-Aware Autonomous Transfer (S3.7)
+S3.7 integrates the S3.6 `TransferCarrier` migration mechanism into the Flux Gateway HTTP transfer flow, making Gateway-initiated transfers resilient to path/session failure without the Gateway implementing any migration logic.
+```text
+                     ┌──────────────┐
+                     │    Client    │
+                     └──────┬───────┘
+                            │ HTTP
+                            ▼
+                 ┌──────────────────────┐
+                 │   Gateway Adapter    │
+                 │  (routes/transfer)   │
+                 │                      │
+                 │  • transfer_id       │
+                 │  • cancel token      │
+                 │  • progress tracker  │
+                 │  • CarrierReturnGrd  │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                 ┌──────────────────────┐
+                 │   TransferManager    │
+                 │ send_collection_     │
+                 │   with_carrier(...)  │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                 ┌──────────────────────┐
+                 │  TransferCarrier     │
+                 │  (owns current       │
+                 │   Session + state)   │
+                 └──────────┬───────────┘
+                            │
+                 ┌──────────┴───────────┐
+                 ▼                      ▼
+              Session              PathSelector
+                 │                      │
+                 ▼                      ▼
+             Transport             PathRegistry
+                 │
+          ┌──────┴──────┐
+          ▼             ▼
+       Path A         Path B
+       (dead)        (active)
+```
+
+* **Gateway is a thin adapter:** The Gateway constructs a `btTransferCarrier`, passes it to `btTransferManager::sendcollectionwithcarrier()`, and is otherwise unaware of migration events.
+
+* **CarrierReturnGuard:** An RAII guard that holds the carrier (not a bare Session) and returns `btcarrier.session` to the pool on drop — ensuring the current (possibly post-migration) session is returned, never a stale one.
+
+* **Lazy PathId resolution:** The Gateway resolves the active `btPathId` by matching `btsession.remoteaddr()` against `btPathRegistry` entries at transfer start time. No persistent session-to-path mapping required.
+
+* **Transfer identity stability:** The UUID-based `bttransferid`, cancellation token, and progress tracker remain unchanged across any number of internal migrations. The Gateway client sees one continuous transfer.
+
+* **Ownership boundary preserved:** Path selection, health monitoring, migration state, and session replacement all remain exclusively within Flux Core. The Gateway knows only: transfer exists, progressed, completed, failed, or was cancelled.

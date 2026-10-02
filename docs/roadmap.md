@@ -20,4 +20,5 @@
 - [x] S3.4: Transfer Progress Observability
 - [x] S3.5: Path-Aware Transfer Continuity
 - [x] S3.6: Path-Aware Autonomous Transfer Migration
-- [ ] S3.7: High-Bandwidth Multipath Concurrent Transport
+- [x] S3.7: Gateway-Aware Autonomous Transfer
+- [ ] S3.8: High-Bandwidth Multipath Concurrent Transport
